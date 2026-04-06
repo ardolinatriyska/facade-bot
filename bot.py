@@ -2,7 +2,6 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-
 import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
 
@@ -88,7 +87,7 @@ def start_shift(message):
     if user["shift_started"]:
         send_with_keyboard(
             message,
-            f"Зміна вже відкрита.\nПочаток: {format_datetime(user['shift_start_time'])}",
+            f"{user['full_name']}\nЗміна вже відкрита.\nПочаток: {format_datetime(user['shift_start_time'])}",
         )
         return
 
@@ -98,10 +97,10 @@ def start_shift(message):
     user["break_start_time"] = None
     user["total_break"] = timedelta()
 
-   send_with_keyboard(
-    message,
-    f"{user['full_name']}\nПочаток зміни зафіксовано.\nЧас: {format_datetime(user['shift_start_time'])}",
-)
+    send_with_keyboard(
+        message,
+        f"{user['full_name']}\nПочаток зміни зафіксовано.\nЧас: {format_datetime(user['shift_start_time'])}",
+    )
 
 
 def start_break(message):
@@ -117,17 +116,18 @@ def start_break(message):
     if user["break_active"]:
         send_with_keyboard(
             message,
-            f"Перерва вже триває.\nПочаток перерви: {format_datetime(user['break_start_time'])}",
+            f"{user['full_name']}\nПерерва вже триває.\nПочаток перерви: {format_datetime(user['break_start_time'])}",
         )
         return
 
     user["break_active"] = True
     user["break_start_time"] = now_dt()
 
-  send_with_keyboard(
-    message,
-    f"{user['full_name']}\nПерерва почалась.\nЧас: {format_datetime(user['break_start_time'])}",
-)
+    send_with_keyboard(
+        message,
+        f"{user['full_name']}\nПерерва почалась.\nЧас: {format_datetime(user['break_start_time'])}",
+    )
+
 
 def stop_break(message):
     user = get_user(message.from_user.id, get_user_name(message))
@@ -146,12 +146,12 @@ def stop_break(message):
     user["break_active"] = False
     user["break_start_time"] = None
 
- send_with_keyboard(
-    message,
-    f"{user['full_name']}\nПерерву завершено.\n"
-    f"Тривалість цієї перерви: {format_duration(break_duration)}\n"
-    f"Загальний час перерв: {format_duration(user['total_break'])}",
-)
+    send_with_keyboard(
+        message,
+        f"{user['full_name']}\nПерерву завершено.\n"
+        f"Тривалість цієї перерви: {format_duration(break_duration)}\n"
+        f"Загальний час перерв: {format_duration(user['total_break'])}",
+    )
 
 
 def end_shift(message):
@@ -171,15 +171,15 @@ def end_shift(message):
     total_time = shift_end - user["shift_start_time"]
     work_time = total_time - user["total_break"]
 
-   summary = (
-    f"{user['full_name']}\n"
-    "Кінець зміни зафіксовано.\n\n"
-    f"Початок: {format_datetime(user['shift_start_time'])}\n"
-    f"Кінець: {format_datetime(shift_end)}\n"
-    f"Загальна тривалість: {format_duration(total_time)}\n"
-    f"Перерви: {format_duration(user['total_break'])}\n"
-    f"Чистий робочий час: {format_duration(work_time)}"
-)
+    summary = (
+        f"{user['full_name']}\n"
+        "Кінець зміни зафіксовано.\n\n"
+        f"Початок: {format_datetime(user['shift_start_time'])}\n"
+        f"Кінець: {format_datetime(shift_end)}\n"
+        f"Загальна тривалість: {format_duration(total_time)}\n"
+        f"Перерви: {format_duration(user['total_break'])}\n"
+        f"Чистий робочий час: {format_duration(work_time)}"
+    )
 
     user["shift_started"] = False
     user["shift_start_time"] = None
@@ -291,4 +291,3 @@ def handle_text(message):
 
 print("Bot is running...")
 bot.infinity_polling(skip_pending=True)
-
