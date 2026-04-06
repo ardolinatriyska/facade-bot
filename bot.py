@@ -1,11 +1,14 @@
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 
 import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
 
 
 TOKEN = os.getenv("TOKEN")
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 if not TOKEN:
     raise ValueError("TOKEN is not set")
@@ -22,7 +25,7 @@ STATUS_TEXT = "Мій статус"
 
 
 def now_dt():
-    return datetime.now()
+    return datetime.now(KYIV_TZ)
 
 
 def format_datetime(value):
