@@ -263,30 +263,25 @@ def status_command(message):
 def handle_text(message):
     text = (message.text or "").strip()
 
-    if text == START_SHIFT_TEXT:
-        start_shift(message)
-    elif text == START_BREAK_TEXT:
-        start_break(message)
-    elif text == STOP_BREAK_TEXT:
-        stop_break(message)
-    elif text == END_SHIFT_TEXT:
-        end_shift(message)
-    elif text == STATUS_TEXT:
-        show_status(message)
-    elif text.startswith("/start"):
-        start_command(message)
-    elif text.startswith("/work"):
-        start_shift(message)
-    elif text.startswith("/break"):
-        start_break(message)
-    elif text.startswith("/stop_break"):
-        stop_break(message)
-    elif text.startswith("/stop"):
-        end_shift(message)
-    elif text.startswith("/status"):
-        show_status(message)
-    else:
-        send_with_keyboard(message, "Використайте кнопки нижче або команду /start.")
+    commands_map = {
+        START_SHIFT_TEXT: start_shift,
+        START_BREAK_TEXT: start_break,
+        STOP_BREAK_TEXT: stop_break,
+        END_SHIFT_TEXT: end_shift,
+        STATUS_TEXT: show_status,
+    }
+
+    handler = commands_map.get(text)
+
+    if handler:
+        handler(message)
+        return
+
+    if message.chat.type == "private":
+        send_with_keyboard(
+            message,
+            "Команда не розпізнана. Будь ласка, скористайтеся кнопками меню.",
+        )
 
 
 print("Bot is running...")
