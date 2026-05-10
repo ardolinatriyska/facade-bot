@@ -19,6 +19,13 @@ if not TOKEN:
     raise ValueError("TOKEN is not set")
 
 bot = telebot.TeleBot(TOKEN)
+
+@bot.message_handler(commands=["chat_id"])
+def chat_id_command(message):
+    bot.send_message(
+        message.chat.id,
+        f"chat_id цієї групи:\n{message.chat.id}"
+    )
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
