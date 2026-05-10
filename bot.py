@@ -31,6 +31,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+@bot.message_handler(commands=["my_id"])
+def my_id_command(message):
+    bot.send_message(
+        message.chat.id,
+        f"Твій user_id:\n{message.from_user.id}"
+    )
 def get_sheet():
     creds_dict = json.loads(GOOGLE_CREDENTIALS)
 
