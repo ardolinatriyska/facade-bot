@@ -45,6 +45,18 @@ def get_sheet():
 
     return spreadsheet
 
+def get_capture_sheet(chat_id):
+    spreadsheet = get_sheet()
+    captures_sheet = spreadsheet.worksheet("captures")
+
+    rows = captures_sheet.get_all_records()
+
+    for row in rows:
+        if str(row["telegram_chat_id"]) == str(chat_id):
+            return spreadsheet.worksheet(row["sheet_name"])
+
+    return None
+
 users = {}
 
 START_SHIFT_TEXT = "Початок зміни"
