@@ -1,4 +1,7 @@
 import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -6,13 +9,34 @@ import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
 
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
+SHEET_ID = os.getenv("SHEET_ID")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 if not TOKEN:
     raise ValueError("TOKEN is not set")
 
 bot = telebot.TeleBot(TOKEN)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_sheet():
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+
+    credentials = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=SCOPES,
+    )
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet = client.open_by_key(SHEET_ID)
+
+    return spreadsheet
 
 users = {}
 
