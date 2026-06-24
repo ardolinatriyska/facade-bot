@@ -242,7 +242,103 @@ def get_capture_sheet(chat_id):
             return spreadsheet.worksheet(row["sheet_name"])
 
     return None
+def get_worker(user_id):
+    spreadsheet = get_sheet()
+    workers_sheet = spreadsheet.worksheet("workers")
 
+    rows = workers_sheet.get_all_records()
+
+    for row in rows:
+        if str(row.get("telegram_user_id", "")).strip() == str(user_id).strip():
+            active = str(row.get("active", "")).strip().upper()
+
+            if active != "TRUE":
+                return None
+
+            return {
+                "telegram_user_id": str(row.get("telegram_user_id", "")).strip(),
+                "name": str(row.get("name", "")).strip(),
+                "username": str(row.get("username", "")).strip(),
+                "column": str(row.get("column", "")).strip().upper(),
+            }
+
+    return None
+def column_letter_to_number(column_letter):
+    result = 0
+
+    for char in column_letter.upper():
+        if char.isalpha():
+            result = result * 26 + (ord(char) - ord("A") + 1)
+
+    return result
+
+
+def parse_sheet_number(value):
+    if value is None:
+        return 0.0
+
+    text = str(value).strip().replace(",", ".")
+
+    if text == "" or text == "-":
+        return 0.0
+
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def find_date_row(worksheet, target_date):
+    dates = worksheet.col_values(2)  # колонка B
+
+    for row_number, value in enumerate(dates, start=1):
+        if str(value).strip() == target_date:
+            return row_number
+
+    return None
+
+
+def write_work_time_to_sheet(message, work_time, shift_start_time):
+    worker = get_worker(message.from_user.id)
+
+    if worker is None:
+        send_with_keyboard(
+            message,
+            "❌ Працівника не знайдено у вкладці workers або він не активний."
+        )
+        return False
+
+    worksheet = get_capture_sheet(message.chat.id)
+
+    if worksheet is None:
+        send_with_keyboard(
+            message,
+            "❌ Ця Telegram-група не привʼязана до захватки у вкладці captures."
+        )
+        return False
+
+    target_date = shift_start_time.strftime("%d.%m")
+    row_number = find_date_row(worksheet, target_date)
+
+    if row_number is None:
+        send_with_keyboard(
+            message,
+            f"❌ У вкладці {worksheet.title} не знайдено дату {target_date} у колонці B."
+        )
+        return False
+
+    column_number = column_letter_to_number(worker["column"])
+
+    hours = round(work_time.total_seconds() / 3600, 2)
+
+    existing_value = worksheet.cell(row_number, column_number).value
+    existing_hours = parse_sheet_number(existing_value)
+
+    total_hours = round(existing_hours + hours, 2)
+
+    worksheet.update_cell(row_number, column_number, total_hours)
+
+    return True
 users = {}
 
 START_SHIFT_TEXT = "Початок зміни"
@@ -406,7 +502,11 @@ def end_shift(message):
         total_time,
         work_time
     )
-
+    write_work_time_to_sheet(
+        message,
+        work_time,
+        user["shift_start_time"]
+    )
     summary = (
         f"{user['full_name']}\n"
         "Кінець зміни зафіксовано.\n\n"
