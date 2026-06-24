@@ -119,6 +119,15 @@ def my_id_command(message):
         message.chat.id,
         f"Твій user_id:\n{message.from_user.id}"
     )
+@bot.message_handler(commands=["thread_id"])
+def thread_id_command(message):
+    thread_id = getattr(message, "message_thread_id", None)
+
+    bot.send_message(
+        message.chat.id,
+        f"chat_id:\n{message.chat.id}\n\nthread_id:\n{thread_id}",
+        message_thread_id=thread_id
+    )
 def get_sheet():
     if GOOGLE_CREDENTIALS_FILE:
         credentials = Credentials.from_service_account_file(
