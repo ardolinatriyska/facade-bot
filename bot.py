@@ -615,6 +615,7 @@ def extend_movement_totals(worksheet, total_row, previous_last_data_row, new_las
 
 def sync_daily_material_movement(spreadsheet, message, material, operation, quantity, worker, timestamp):
     worksheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
+    pending_updates = []
     date_values = worksheet.col_values(1)
     row_number = next(
         (index for index, value in enumerate(date_values, start=1) if index >= 5 and date_matches(value, timestamp)),
@@ -635,12 +636,10 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
                 row_number - 1,
                 row_number,
             )
-        worksheet.batch_update([
-            {
-                "range": f"A{row_number}",
-                "values": [[timestamp.strftime("%d.%m.%Y")]],
-            }
-        ], value_input_option="USER_ENTERED")
+        pending_updates.append({
+            "range": f"'{DAILY_MATERIAL_SHEET}'!A{row_number}",
+            "values": [[timestamp.strftime("%d.%m.%Y")]],
+        })
 
     details = worksheet.get(f"B{row_number}:D{row_number}")
     details = details[0] if details else ["", "", ""]
@@ -657,10 +656,20 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
     column = get_daily_material_column(worksheet, material, operation)
     cell = f"{column_letter(column)}{row_number}"
     current_value = worksheet.acell(cell).value
-    worksheet.batch_update([
-        {"range": f"B{row_number}:D{row_number}", "values": [details]},
-        {"range": cell, "values": [[parse_sheet_number(current_value) + quantity]]},
-    ], value_input_option="USER_ENTERED")
+    pending_updates.extend([
+        {
+            "range": f"'{DAILY_MATERIAL_SHEET}'!B{row_number}:D{row_number}",
+            "values": [details],
+        },
+        {
+            "range": f"'{DAILY_MATERIAL_SHEET}'!{cell}",
+            "values": [[parse_sheet_number(current_value) + quantity]],
+        },
+    ])
+    spreadsheet.values_batch_update({
+        "valueInputOption": "USER_ENTERED",
+        "data": pending_updates,
+    })
     return row_number
 
 
