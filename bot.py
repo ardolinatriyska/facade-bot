@@ -6,6 +6,7 @@ load_dotenv()
 
 import json
 import re
+import base64
 import urllib.error
 import urllib.request
 from difflib import SequenceMatcher
@@ -269,6 +270,7 @@ INVENTORY_TEXT = "Інвентаризація"
 MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
 INVENTORY_CONFIRM_TEXT = "Підтвердити інвентаризацію"
+INVOICE_CONFIRM_TEXT = "Підтвердити накладну"
 
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
@@ -785,6 +787,105 @@ def interpret_material_with_ai(text, catalog):
     return {"quantity": quantity, "operation": operation, "selected": selected}
 
 
+def interpret_invoice_photo_with_ai(image_bytes, catalog):
+    """Extract a delivery invoice into only catalog-backed material arrivals."""
+    if not OPENAI_API_KEY or not catalog:
+        return None
+
+    materials = [
+        {
+            "name": str(row.get("Матеріал", "")),
+            "aliases": str(row.get("Синоніми", "")),
+            "unit": str(row.get("Од. виміру / примітка", "")),
+        }
+        for row in catalog
+        if row.get("Матеріал")
+    ]
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "supplier": {"type": ["string", "null"]},
+            "invoice_number": {"type": ["string", "null"]},
+            "invoice_date": {"type": ["string", "null"]},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "material": {"type": ["string", "null"]},
+                        "raw_name": {"type": "string"},
+                        "quantity": {"type": ["number", "null"]},
+                        "unit": {"type": ["string", "null"]},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["material", "raw_name", "quantity", "unit", "confidence"],
+                },
+            },
+        },
+        "required": ["supplier", "invoice_number", "invoice_date", "items"],
+    }
+    instructions = (
+        "Розпізнай українську накладну з фото. Витягни постачальника, номер, дату та всі позиції. "
+        "Для material використовуй лише точну назву з каталогу; зіставляй за назвою, одиницею й синонімами. "
+        "Якщо відповідника немає або кількість нечитабельна, поверни material або quantity як null. "
+        "Не вигадуй дані. Результат є лише чернеткою, яку людина підтвердить окремо."
+    )
+    image_data = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": json.dumps({"catalog": materials}, ensure_ascii=False)},
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_data}"},
+            ],
+        }],
+        "text": {"format": {"type": "json_schema", "name": "invoice_delivery", "strict": True, "schema": schema}},
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        parsed = json.loads(result.get("output_text", ""))
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return None
+
+    catalog_by_name = {str(row.get("Матеріал", "")): row for row in catalog}
+    items = []
+    unmatched = []
+    for item in parsed.get("items", []):
+        material = catalog_by_name.get(str(item.get("material") or ""))
+        try:
+            quantity = float(item.get("quantity"))
+        except (TypeError, ValueError):
+            quantity = None
+        if material and quantity and quantity > 0 and float(item.get("confidence", 0) or 0) >= 0.65:
+            items.append({"material": material, "quantity": quantity})
+        else:
+            unmatched.append(str(item.get("raw_name") or "невідома позиція"))
+
+    if not items:
+        return None
+    return {
+        "supplier": str(parsed.get("supplier") or "").strip(),
+        "invoice_number": str(parsed.get("invoice_number") or "").strip(),
+        "invoice_date": str(parsed.get("invoice_date") or "").strip(),
+        "items": items,
+        "unmatched": unmatched,
+    }
+
+
 def detect_material_operation(text):
     normalized = normalize_material_text(text)
     if any(word in normalized for word in ("замовляю", "замовити", "замовив", "замовила", "замовлення")):
@@ -1054,6 +1155,109 @@ def set_inventory_quantity(message, text, pending):
     return select_material_candidate(message, pending["selected"].get("Матеріал", ""))
 
 
+def send_invoice_preview(message, invoice):
+    lines = ["Чернетка надходження з накладної:"]
+    if invoice.get("supplier"):
+        lines.append(f"Постачальник: {invoice['supplier']}")
+    if invoice.get("invoice_number"):
+        lines.append(f"Накладна: {invoice['invoice_number']}")
+    if invoice.get("invoice_date"):
+        lines.append(f"Дата накладної: {invoice['invoice_date']}")
+    lines.append("")
+    for item in invoice["items"]:
+        material = item["material"]
+        unit = material.get("Од. виміру / примітка", "") or "од."
+        lines.append(f"• {material['Матеріал']} — {item['quantity']:g} {unit}")
+    if invoice.get("unmatched"):
+        lines.append("\nНе додано без уточнення: " + ", ".join(invoice["unmatched"]))
+    lines.append("\nПідтвердити надходження?")
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(INVOICE_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    bot.send_message(message.chat.id, "\n".join(lines), **options)
+
+
+def handle_invoice_photo(message):
+    if not is_materials_topic(message):
+        return
+    if not OPENAI_API_KEY:
+        send_with_keyboard(message, "Розпізнавання накладних ще не налаштоване: потрібен ключ OpenAI API.")
+        return
+
+    try:
+        photo = message.photo[-1]
+        file_info = bot.get_file(photo.file_id)
+        image_bytes = bot.download_file(file_info.file_path)
+        invoice = interpret_invoice_photo_with_ai(image_bytes, get_material_catalog())
+    except Exception:
+        invoice = None
+
+    if not invoice:
+        send_with_keyboard(
+            message,
+            "Не зміг безпечно розпізнати позиції накладної. Надішли чіткіше фото або додай назви в довідник матеріалів.",
+        )
+        return
+
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {"kind": "invoice", "invoice": invoice}
+    send_invoice_preview(message, invoice)
+
+
+def save_invoice_delivery(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if not pending or pending.get("kind") != "invoice":
+        send_with_keyboard(message, "Немає накладної для підтвердження.")
+        return
+
+    invoice = pending["invoice"]
+    worker = get_worker(message.from_user.id) or {}
+    capture = user.get("selected_capture") or {}
+    timestamp = now_dt()
+    spreadsheet = get_sheet()
+    note_parts = []
+    if invoice.get("supplier"):
+        note_parts.append(f"Постачальник: {invoice['supplier']}")
+    if invoice.get("invoice_number"):
+        note_parts.append(f"Накладна: {invoice['invoice_number']}")
+    if invoice.get("invoice_date"):
+        note_parts.append(f"Дата: {invoice['invoice_date']}")
+    note = "; ".join(note_parts)
+    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
+
+    for item in invoice["items"]:
+        material = item["material"]
+        quantity = item["quantity"]
+        sync_daily_material_movement(
+            spreadsheet, message, material, "Надходження", quantity, worker, timestamp,
+        )
+        log_sheet.append_row([
+            timestamp.strftime("%d.%m.%Y"),
+            "Надходження за накладною",
+            material["Матеріал"],
+            quantity,
+            material.get("Од. виміру / примітка", ""),
+            capture.get("name", ""),
+            worker.get("name") or user["full_name"],
+            worker.get("role", ""),
+            note,
+            str(message.from_user.id),
+            str(message.chat.id),
+            format_datetime(timestamp),
+        ])
+
+    user["pending_material"] = None
+    send_with_keyboard(
+        message,
+        f"Накладну записано: {len(invoice['items'])} позицій додано в «Прийнято» та «Операції матеріалів».",
+    )
+
+
 def cancel_material_operation(message):
     user = get_user(message.from_user.id, get_user_name(message))
     user["pending_material"] = None
@@ -1283,6 +1487,11 @@ def status_command(message):
     show_status(message)
 
 
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message):
+    handle_invoice_photo(message)
+
+
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     text = (message.text or "").strip()
@@ -1346,6 +1555,10 @@ def handle_materials_text(message, text):
 
     if text == INVENTORY_CONFIRM_TEXT:
         save_inventory_record(message)
+        return
+
+    if text == INVOICE_CONFIRM_TEXT:
+        save_invoice_delivery(message)
         return
 
     user = get_user(message.from_user.id, get_user_name(message))
