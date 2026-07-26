@@ -267,6 +267,7 @@ END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
 MATERIALS_TEXT = "Взяти матеріал"
 INVENTORY_TEXT = "Інвентаризація"
+BALANCE_TEXT = "Перевірити залишок"
 MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
 INVENTORY_CONFIRM_TEXT = "Підтвердити інвентаризацію"
@@ -370,6 +371,7 @@ def main_keyboard():
 def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(INVENTORY_TEXT))
+    markup.row(KeyboardButton(BALANCE_TEXT))
     return markup
 
 
@@ -1167,6 +1169,51 @@ def set_inventory_quantity(message, text, pending):
     return select_material_candidate(message, pending["selected"].get("Матеріал", ""))
 
 
+def start_balance_check(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {
+        "kind": "balance_material",
+        "candidates": [],
+    }
+    send_with_keyboard(message, "Напишіть назву матеріалу, залишок якого потрібно перевірити.")
+
+
+def choose_balance_material(message, text, pending):
+    selected = next(
+        (row for row in pending.get("candidates", []) if row.get("Матеріал") == text),
+        None,
+    )
+    if selected:
+        movement_sheet = get_sheet().worksheet(DAILY_MATERIAL_SHEET)
+        balance = get_book_material_balance(movement_sheet, selected)
+        unit = selected.get("Од. виміру / примітка", "") or "од."
+        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
+        send_with_keyboard(
+            message,
+            f"Залишок за обліком:\n{selected['Матеріал']} — {balance:g} {unit}.",
+        )
+        return True
+
+    candidates = find_material_candidates(text)
+    if not candidates:
+        send_with_keyboard(message, "Не знайшов матеріал у довіднику. Напишіть назву точніше або додайте синонім.")
+        return True
+    pending["candidates"] = candidates
+    if len(candidates) == 1:
+        return choose_balance_material(message, candidates[0].get("Матеріал", ""), pending)
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for candidate in candidates:
+        markup.row(KeyboardButton(str(candidate.get("Матеріал", ""))))
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    bot.send_message(message.chat.id, "Уточніть матеріал для перевірки залишку.", **options)
+    return True
+
+
 def send_invoice_preview(message, invoice):
     lines = ["Чернетка надходження з накладної:"]
     if invoice.get("supplier"):
@@ -1554,6 +1601,10 @@ def handle_text(message):
 
 
 def handle_materials_text(message, text):
+    if text == BALANCE_TEXT:
+        start_balance_check(message)
+        return
+
     if text == INVENTORY_TEXT:
         start_inventory(message, text)
         return
@@ -1588,6 +1639,9 @@ def handle_materials_text(message, text):
         return
     if pending and pending.get("kind") == "inventory_quantity":
         set_inventory_quantity(message, text, pending)
+        return
+    if pending and pending.get("kind") == "balance_material":
+        choose_balance_material(message, text, pending)
         return
     if pending and select_material_candidate(message, text):
         return
