@@ -265,8 +265,10 @@ SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
 MATERIALS_TEXT = "Взяти матеріал"
+INVENTORY_TEXT = "Інвентаризація"
 MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
+INVENTORY_CONFIRM_TEXT = "Підтвердити інвентаризацію"
 
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
@@ -278,7 +280,6 @@ MATERIAL_BALANCE_HEADERS = [
     "матеріал", "од. виміру", "початковий залишок", "надійшло",
     "видано", "поточний залишок",
 ]
-
 
 DAILY_MATERIAL_SHEET = "Рух матеріалів"
 DAILY_MOVEMENT_COLUMNS = {
@@ -366,7 +367,7 @@ def main_keyboard():
 
 def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    markup.row(KeyboardButton(MATERIALS_TEXT))
+    markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(INVENTORY_TEXT))
     return markup
 
 
@@ -597,6 +598,12 @@ def get_daily_material_column(worksheet, material, operation):
     )
 
 
+def get_book_material_balance(worksheet, material):
+    """Read the calculated on-book balance shown above a material's three columns."""
+    received_column = get_daily_material_column(worksheet, material, "Надходження")
+    return parse_sheet_number(worksheet.acell(f"{column_letter(received_column)}4").value)
+
+
 def extend_movement_totals(worksheet, total_row, previous_last_data_row, new_last_data_row):
     formulas = worksheet.row_values(total_row, value_render_option="FORMULA")
     updates = []
@@ -820,6 +827,7 @@ def send_material_choice(message, text):
 
     user = get_user(message.from_user.id, get_user_name(message))
     user["pending_material"] = {
+        "kind": "material",
         "operation": ai_result["operation"] if ai_result else detect_material_operation(text),
         "quantity": quantity,
         "candidates": candidates,
@@ -838,7 +846,14 @@ def send_material_choice(message, text):
     thread_id = getattr(message, "message_thread_id", None)
     if thread_id is not None:
         options["message_thread_id"] = thread_id
-    bot.send_message(message.chat.id, "Уточніть матеріал:", **options)
+    visible_options = "\n".join(
+        f"• {candidate.get('Матеріал', '')}" for candidate in candidates
+    )
+    bot.send_message(
+        message.chat.id,
+        f"Уточніть матеріал — оберіть кнопку або надішліть точну назву:\n{visible_options}",
+        **options,
+    )
 
 
 def select_material_candidate(message, material_name):
@@ -856,6 +871,21 @@ def select_material_candidate(message, material_name):
 
     pending["selected"] = selected
     unit = selected.get("Од. виміру / примітка", "") or "од."
+    if pending.get("kind") == "inventory":
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.row(KeyboardButton(INVENTORY_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
+        options = {"reply_markup": markup}
+        thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is not None:
+            options["message_thread_id"] = thread_id
+        bot.send_message(
+            message.chat.id,
+            f"Інвентаризація: фактичний залишок {pending['quantity']:g} {unit}\n"
+            f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?",
+            **options,
+        )
+        return True
+
     operation = pending["operation"].lower()
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.row(KeyboardButton(MATERIAL_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
@@ -915,6 +945,113 @@ def save_material_operation(message):
         f"Записано: {pending['operation'].lower()} — {pending['quantity']:g} "
         f"{material.get('Од. виміру / примітка', '')}\nМатеріал: {material['Матеріал']}",
     )
+
+
+def save_inventory_record(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if not pending or pending.get("kind") != "inventory" or not pending.get("selected"):
+        send_with_keyboard(message, "Немає інвентаризації для підтвердження.")
+        return
+
+    material = pending["selected"]
+    worker = get_worker(message.from_user.id) or {}
+    capture = user.get("selected_capture") or {}
+    timestamp = now_dt()
+    spreadsheet = get_sheet()
+    movement_sheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
+    book_balance = get_book_material_balance(movement_sheet, material)
+    actual_balance = pending["quantity"]
+    adjustment = actual_balance - book_balance
+    adjustment_operation = "Надходження" if adjustment > 0 else "Видача"
+
+    if adjustment:
+        sync_daily_material_movement(
+            spreadsheet,
+            message,
+            material,
+            adjustment_operation,
+            abs(adjustment),
+            worker,
+            timestamp,
+        )
+
+    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
+    log_sheet.append_row([
+        timestamp.strftime("%d.%m.%Y"),
+        "Інвентаризація" if not adjustment else f"Інвентаризація → {adjustment_operation}",
+        material["Матеріал"],
+        abs(adjustment),
+        material.get("Од. виміру / примітка", ""),
+        capture.get("name", ""),
+        worker.get("name") or user["full_name"],
+        worker.get("role", ""),
+        f"Облік: {book_balance:g}; фактично: {actual_balance:g}; коригування: {adjustment:+g}",
+        str(message.from_user.id),
+        format_datetime(timestamp),
+    ])
+    user["pending_material"] = None
+    send_with_keyboard(
+        message,
+        f"Інвентаризацію записано: {material['Матеріал']}. "
+        f"Облік {book_balance:g}, фактично {actual_balance:g}; "
+        f"коригування {adjustment:+g} {material.get('Од. виміру / примітка', '')}.",
+    )
+
+
+def start_inventory(message, text):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {
+        "kind": "inventory_material",
+        "candidates": [],
+        "selected": None,
+    }
+    send_with_keyboard(message, "Вкажіть матеріал для інвентаризації, наприклад: «малярний скотч».")
+
+
+def choose_inventory_material(message, text, pending):
+    selected = next(
+        (row for row in pending.get("candidates", []) if row.get("Матеріал") == text),
+        None,
+    )
+    if selected:
+        pending["selected"] = selected
+        pending["kind"] = "inventory_quantity"
+        movement_sheet = get_sheet().worksheet(DAILY_MATERIAL_SHEET)
+        book_balance = get_book_material_balance(movement_sheet, selected)
+        unit = selected.get("Од. виміру / примітка", "") or "од."
+        send_with_keyboard(
+            message,
+            f"Матеріал: {selected['Матеріал']}\n"
+            f"За обліком на складі: {book_balance:g} {unit}.\n"
+            "Напишіть фактичну кількість.",
+        )
+        return True
+
+    candidates = find_material_candidates(text)
+    if not candidates:
+        send_with_keyboard(message, "Не знайшов матеріал у довіднику. Напишіть назву точніше або додайте синонім.")
+        return True
+    pending["candidates"] = candidates
+    if len(candidates) == 1:
+        return choose_inventory_material(message, candidates[0].get("Матеріал", ""), pending)
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for candidate in candidates:
+        markup.row(KeyboardButton(str(candidate.get("Матеріал", ""))))
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    bot.send_message(message.chat.id, "Уточніть матеріал для інвентаризації.", reply_markup=markup)
+    return True
+
+
+def set_inventory_quantity(message, text, pending):
+    quantity = extract_material_quantity(text)
+    if quantity is None or quantity < 0:
+        send_with_keyboard(message, "Не бачу кількості. Напишіть фактичний залишок числом.")
+        return True
+    pending["quantity"] = quantity
+    pending["kind"] = "inventory"
+    return select_material_candidate(message, pending["selected"].get("Матеріал", ""))
 
 
 def cancel_material_operation(message):
@@ -1188,6 +1325,10 @@ def handle_text(message):
 
 
 def handle_materials_text(message, text):
+    if text == INVENTORY_TEXT:
+        start_inventory(message, text)
+        return
+
     if text == MATERIALS_TEXT:
         send_with_keyboard(
             message,
@@ -1203,8 +1344,18 @@ def handle_materials_text(message, text):
         save_material_operation(message)
         return
 
+    if text == INVENTORY_CONFIRM_TEXT:
+        save_inventory_record(message)
+        return
+
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
+    if pending and pending.get("kind") == "inventory_material":
+        choose_inventory_material(message, text, pending)
+        return
+    if pending and pending.get("kind") == "inventory_quantity":
+        set_inventory_quantity(message, text, pending)
+        return
     if pending and select_material_candidate(message, text):
         return
 
