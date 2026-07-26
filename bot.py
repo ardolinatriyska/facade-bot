@@ -412,7 +412,13 @@ def get_user(user_id, full_name):
 
 
 def send_with_keyboard(message, text):
-    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
+    send_options = {"reply_markup": main_keyboard()}
+    thread_id = getattr(message, "message_thread_id", None)
+
+    if thread_id is not None:
+        send_options["message_thread_id"] = thread_id
+
+    bot.send_message(message.chat.id, text, **send_options)
 
 
 def start_shift(message):
