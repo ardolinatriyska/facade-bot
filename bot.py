@@ -840,7 +840,7 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
             "role": "user",
             "content": [
                 {"type": "input_text", "text": json.dumps({"catalog": materials}, ensure_ascii=False)},
-                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_data}"},
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_data}", "detail": "high"},
             ],
         }],
         "text": {"format": {"type": "json_schema", "name": "invoice_delivery", "strict": True, "schema": schema}},
@@ -858,8 +858,10 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
         with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
         parsed = json.loads(result.get("output_text", ""))
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
-        return None
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"OpenAI API: {error.code}") from error
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("OpenAI API не повернув структуроване розпізнавання") from error
 
     catalog_by_name = {str(row.get("Матеріал", "")): row for row in catalog}
     items = []
@@ -875,8 +877,6 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
         else:
             unmatched.append(str(item.get("raw_name") or "невідома позиція"))
 
-    if not items:
-        return None
     return {
         "supplier": str(parsed.get("supplier") or "").strip(),
         "invoice_number": str(parsed.get("invoice_number") or "").strip(),
@@ -1193,13 +1193,21 @@ def handle_invoice_photo(message):
         file_info = bot.get_file(photo.file_id)
         image_bytes = bot.download_file(file_info.file_path)
         invoice = interpret_invoice_photo_with_ai(image_bytes, get_material_catalog())
-    except Exception:
-        invoice = None
-
-    if not invoice:
+    except Exception as error:
+        print(f"Invoice recognition failed: {type(error).__name__}: {error}")
         send_with_keyboard(
             message,
-            "Не зміг безпечно розпізнати позиції накладної. Надішли чіткіше фото або додай назви в довідник матеріалів.",
+            "Не вдалося обробити фото накладної. Деталь помилки є в логах Railway; перевірю її за наступним записом.",
+        )
+        return
+
+    if not invoice or not invoice.get("items"):
+        unmatched = ", ".join((invoice or {}).get("unmatched", []))
+        send_with_keyboard(
+            message,
+            "Фото прочитано, але жодну позицію не вдалося зіставити з довідником матеріалів. "
+            + (f"Розпізнано: {unmatched}. " if unmatched else "")
+            + "Додай відповідні назви або синоніми в довідник і надішли фото ще раз.",
         )
         return
 
