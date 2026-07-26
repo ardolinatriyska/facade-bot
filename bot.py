@@ -291,7 +291,8 @@ def get_user_name(message):
     first = message.from_user.first_name or ""
     last = message.from_user.last_name or ""
     full_name = f"{first} {last}".strip()
-    if not full_name:
+@bot.message_handler(commands=["start"])
+def start_command(message):    if not full_name:
         full_name = message.from_user.username or str(message.from_user.id)
     return full_name
 
