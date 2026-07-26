@@ -635,10 +635,12 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
                 row_number - 1,
                 row_number,
             )
-        worksheet.update(
-            values=[[timestamp.strftime("%d.%m.%Y")]],
-            range_name=f"A{row_number}",
-        )
+        worksheet.batch_update([
+            {
+                "range": f"A{row_number}",
+                "values": [[timestamp.strftime("%d.%m.%Y")]],
+            }
+        ], value_input_option="USER_ENTERED")
 
     details = worksheet.get(f"B{row_number}:D{row_number}")
     details = details[0] if details else ["", "", ""]
@@ -652,18 +654,13 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
     details[0] = append_unique_text(details[0], side_label)
     details[1] = append_unique_text(details[1], "RAHUY Bot / склад")
     details[2] = append_unique_text(details[2], worker_name)
-    worksheet.update(
-        values=[details],
-        range_name=f"B{row_number}:D{row_number}",
-    )
-
     column = get_daily_material_column(worksheet, material, operation)
     cell = f"{column_letter(column)}{row_number}"
     current_value = worksheet.acell(cell).value
-    worksheet.update(
-        values=[[parse_sheet_number(current_value) + quantity]],
-        range_name=cell,
-    )
+    worksheet.batch_update([
+        {"range": f"B{row_number}:D{row_number}", "values": [details]},
+        {"range": cell, "values": [[parse_sheet_number(current_value) + quantity]]},
+    ], value_input_option="USER_ENTERED")
     return row_number
 
 
