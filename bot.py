@@ -628,7 +628,7 @@ def handle_text(message):
 
     if handler:
         handler(message)
-        
+        return
     
     if is_direct_message_to_bot(message):
         handle_dialog_message(message)
