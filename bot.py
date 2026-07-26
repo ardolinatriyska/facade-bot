@@ -279,6 +279,14 @@ MATERIAL_BALANCE_HEADERS = [
     "видано", "поточний залишок",
 ]
 
+
+DAILY_MATERIAL_SHEET = "Рух матеріалів"
+DAILY_MOVEMENT_COLUMNS = {
+    "Видача": "Видано",
+    "Надходження": "Прийнято",
+    "Замовлення": "Замовлення",
+}
+
 SHIFT_HEADERS = [
     "дата",
     "працівник",
@@ -463,6 +471,7 @@ def extract_material_quantity(text):
 
     word_numbers = {
         "один": 1, "одна": 1, "одне": 1, "два": 2, "дві": 2,
+        "одну": 1,
         "три": 3, "чотири": 4, "пять": 5, "п'ять": 5,
         "пятьох": 5, "шість": 6, "сім": 7, "вісім": 8,
         "девять": 9, "дев'ять": 9, "десять": 10,
@@ -492,12 +501,161 @@ def material_match_score(text, row):
         "будь", "ласка", "штук", "шт", "штуки", "балон", "балони",
         "один", "одна", "два", "дві", "три", "чотири", "пять", "п'ять",
     }
-    overlap = meaningful_tokens & (name_tokens | alias_tokens)
-    if not overlap:
+    material_tokens = name_tokens | alias_tokens
+    overlap = meaningful_tokens & material_tokens
+    stem_overlap = {
+        query_token
+        for query_token in meaningful_tokens
+        for material_token in material_tokens
+        if len(query_token) >= 4 and len(material_token) >= 4
+        and query_token[:3] == material_token[:3]
+    }
+    if not overlap and not stem_overlap:
         return 0.0
-    token_score = len(overlap) / max(1, len(meaningful_tokens))
+    token_score = len(overlap | stem_overlap) / max(1, len(meaningful_tokens))
     similarity = SequenceMatcher(None, normalized, material_name).ratio()
     return max(token_score, similarity * 0.5)
+
+
+def column_letter(column):
+    result = ""
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def parse_sheet_number(value):
+    try:
+        return float(str(value or "0").replace(" ", "").replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
+def append_unique_text(existing, value):
+    entries = [part.strip() for part in str(existing or "").split(",") if part.strip()]
+    if value and value not in entries:
+        entries.append(value)
+    return ", ".join(entries)
+
+
+def date_matches(value, timestamp):
+    value = str(value or "").strip()
+    return value in {
+        timestamp.strftime("%d.%m.%Y"),
+        timestamp.strftime("%d.%m.%y"),
+    }
+
+
+def legacy_material_score(material, legacy_name):
+    legacy = normalize_material_text(legacy_name)
+    variants = [normalize_material_text(material.get("Матеріал", ""))]
+    variants.extend(material_aliases(material))
+    best_score = 0.0
+    for variant in variants:
+        if not variant or not legacy:
+            continue
+        if variant in legacy or legacy in variant:
+            return 1.0
+        variant_tokens = set(variant.split())
+        legacy_tokens = set(legacy.split())
+        overlap = variant_tokens & legacy_tokens
+        if overlap:
+            best_score = max(best_score, len(overlap) / max(1, len(variant_tokens)))
+        best_score = max(best_score, SequenceMatcher(None, variant, legacy).ratio() * 0.6)
+    return best_score
+
+
+def get_daily_material_column(worksheet, material, operation):
+    headers = worksheet.row_values(2)
+    material_names = worksheet.row_values(3)
+    best_match = (0.0, None)
+    for index, legacy_name in enumerate(material_names, start=1):
+        if not legacy_name:
+            continue
+        score = legacy_material_score(material, legacy_name)
+        if score > best_match[0]:
+            best_match = (score, index)
+
+    if best_match[0] < 0.5 or best_match[1] is None:
+        raise ValueError(f"Не знайшов колонку для матеріалу «{material['Матеріал']}» у «Рух матеріалів»")
+
+    start_column = best_match[1]
+    next_material = len(headers) + 1
+    for index in range(start_column + 1, len(material_names) + 1):
+        if material_names[index - 1]:
+            next_material = index
+            break
+
+    target_header = DAILY_MOVEMENT_COLUMNS[operation]
+    for index in range(start_column, next_material):
+        if str(headers[index - 1]).strip() == target_header:
+            return index
+
+    raise ValueError(
+        f"Для «{material['Матеріал']}» немає поля «{target_header}» у «Рух матеріалів»"
+    )
+
+
+def extend_movement_totals(worksheet, total_row, previous_last_data_row, new_last_data_row):
+    formulas = worksheet.row_values(total_row, value_render_option="FORMULA")
+    updates = []
+    old_end = f":{previous_last_data_row})"
+    new_end = f":{new_last_data_row})"
+    for column, formula in enumerate(formulas, start=1):
+        formula = str(formula or "")
+        if formula.startswith("=SUM(") and formula.endswith(old_end):
+            updates.append({
+                "range": f"{column_letter(column)}{total_row}",
+                "values": [[formula[:-len(old_end)] + new_end]],
+            })
+    if updates:
+        worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
+def sync_daily_material_movement(spreadsheet, message, material, operation, quantity, worker, timestamp):
+    worksheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
+    date_values = worksheet.col_values(1)
+    row_number = next(
+        (index for index, value in enumerate(date_values, start=1) if index >= 5 and date_matches(value, timestamp)),
+        None,
+    )
+    if row_number is None:
+        dated_rows = [
+            index for index, value in enumerate(date_values, start=1)
+            if index >= 5 and str(value or "").strip()
+        ]
+        row_number = max(dated_rows, default=4) + 1
+        row_formulas = worksheet.row_values(row_number, value_render_option="FORMULA")
+        if any(str(value).startswith("=SUM(") for value in row_formulas):
+            worksheet.insert_row([""] * worksheet.col_count, index=row_number)
+            extend_movement_totals(
+                worksheet,
+                row_number + 1,
+                row_number - 1,
+                row_number,
+            )
+        worksheet.update(f"A{row_number}", [[timestamp.strftime("%d.%m.%Y")]])
+
+    details = worksheet.get(f"B{row_number}:D{row_number}")
+    details = details[0] if details else ["", "", ""]
+    details += [""] * (3 - len(details))
+    worker_name = worker.get("name") or get_user_name(message)
+    side_label = {
+        "Видача": "Видача через RAHUY Bot",
+        "Надходження": "Приймання через RAHUY Bot",
+        "Замовлення": "Замовлення через RAHUY Bot",
+    }[operation]
+    details[0] = append_unique_text(details[0], side_label)
+    details[1] = append_unique_text(details[1], "RAHUY Bot / склад")
+    details[2] = append_unique_text(details[2], worker_name)
+    worksheet.update(f"B{row_number}:D{row_number}", [details])
+
+    column = get_daily_material_column(worksheet, material, operation)
+    cell = f"{column_letter(column)}{row_number}"
+    current_value = worksheet.acell(cell).value
+    worksheet.update(cell, [[parse_sheet_number(current_value) + quantity]])
+    return row_number
 
 
 def find_material_candidates(text):
@@ -533,7 +691,7 @@ def interpret_material_with_ai(text, catalog):
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "operation": {"type": "string", "enum": ["Видача", "Надходження", "Невідомо"]},
+            "operation": {"type": "string", "enum": ["Видача", "Надходження", "Замовлення", "Невідомо"]},
             "quantity": {"type": ["number", "null"]},
             "material": {"type": ["string", "null"]},
             "confidence": {"type": "number"},
@@ -583,14 +741,19 @@ def interpret_material_with_ai(text, catalog):
         return None
 
     operation = parsed.get("operation")
-    if operation not in ("Видача", "Надходження"):
+    if operation not in ("Видача", "Надходження", "Замовлення"):
         operation = detect_material_operation(text)
     return {"quantity": quantity, "operation": operation, "selected": selected}
 
 
 def detect_material_operation(text):
     normalized = normalize_material_text(text)
-    if any(word in normalized for word in ("привіз", "привезли", "надійшло", "отримали на склад")):
+    if any(word in normalized for word in ("замовляю", "замовити", "замовив", "замовила", "замовлення")):
+        return "Замовлення"
+    if any(word in normalized for word in (
+        "привіз", "привезли", "надійшло", "отримали на склад",
+        "повернув", "повернула", "повернули", "повернення",
+    )):
         return "Надходження"
     return "Видача"
 
@@ -688,8 +851,17 @@ def save_material_operation(message):
     worker = get_worker(message.from_user.id) or {}
     capture = user.get("selected_capture") or {}
     spreadsheet = get_sheet()
-    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
     timestamp = now_dt()
+    sync_daily_material_movement(
+        spreadsheet,
+        message,
+        material,
+        pending["operation"],
+        pending["quantity"],
+        worker,
+        timestamp,
+    )
+    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
     log_sheet.append_row([
         timestamp.strftime("%d.%m.%Y"),
         pending["operation"],
@@ -1007,6 +1179,8 @@ def handle_materials_text(message, text):
     material_keywords = (
         "взяв", "взяла", "взяли", "видати", "видай", "видав",
         "привіз", "привезли", "надійшло", "отримали",
+        "повернув", "повернула", "повернули",
+        "замовляю", "замовити", "замовив", "замовила",
     )
     if any(keyword in normalize_material_text(text) for keyword in material_keywords):
         send_material_choice(message, text)
