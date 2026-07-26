@@ -180,59 +180,44 @@ def get_lookup_row(spreadsheet, sheet_name, key_column, key_value):
     return {}
 
 
-def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
+def get_active_captures():
     spreadsheet = get_sheet()
+    captures_sheet = spreadsheet.worksheet("Захватки")
+    captures = []
 
-    worker = get_lookup_row(
-        spreadsheet,
-        "workers",
-        "telegram_user_id",
-        message.from_user.id
-    )
+    for row in captures_sheet.get_all_records():
+        if str(row.get("active", "")).strip().upper() != "TRUE":
+            continue
+        if not row.get("назва"):
+            continue
+        captures.append({
+            "capture_id": str(row.get("capture_id", "")).strip(),
+            "name": str(row.get("назва", "")).strip(),
+            "project": str(row.get("обʼєкт", "")).strip(),
+        })
 
-    capture = get_lookup_row(
-        spreadsheet,
-        "captures",
-        "telegram_chat_id",
-        message.chat.id
-    )
+    return captures
 
-    headers = [
-        "timestamp",
-        "date",
-        "chat_id",
-        "telegram_user_id",
-        "worker_name",
-        "role",
-        "brigade",
-        "project",
-        "capture",
-        "sheet_name",
-        "shift_start",
-        "shift_end",
-        "total_time",
-        "break_time",
-        "work_time",
-        "work_hours",
-    ]
 
-    worksheet = get_or_create_worksheet(
-        spreadsheet,
-        "shifts",
-        headers
-    )
+def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
+    capture = user.get("shift_capture")
+    if not capture:
+        raise ValueError("Не вибрано захватку для зміни")
+
+    worker = get_worker(message.from_user.id) or {}
+    spreadsheet = get_sheet()
+    worksheet = spreadsheet.worksheet("Зміни")
 
     worksheet.append_row([
         format_datetime(now_dt()),
         shift_end.strftime("%d.%m.%Y"),
         str(message.chat.id),
         str(message.from_user.id),
-        worker.get("ПІБ") or user["full_name"],
-        worker.get("роль", ""),
-        worker.get("бригада", ""),
-        capture.get("project", ""),
-        capture.get("capture", ""),
-        capture.get("sheet_name", ""),
+        worker.get("name") or user["full_name"],
+        worker.get("role", ""),
+        worker.get("brigade", ""),
+        capture["project"],
+        capture["name"],
         format_datetime(user["shift_start_time"]),
         format_datetime(shift_end),
         format_duration(total_time),
@@ -240,20 +225,9 @@ def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
         format_duration(work_time),
         round(work_time.total_seconds() / 3600, 2),
     ])
-def get_capture_sheet(chat_id):
-    spreadsheet = get_sheet()
-    captures_sheet = spreadsheet.worksheet("captures")
-
-    rows = captures_sheet.get_all_records()
-
-    for row in rows:
-        if str(row["telegram_chat_id"]) == str(chat_id):
-            return spreadsheet.worksheet(row["sheet_name"])
-
-    return None
 def get_worker(user_id):
     spreadsheet = get_sheet()
-    workers_sheet = spreadsheet.worksheet("workers")
+    workers_sheet = spreadsheet.worksheet("Працівники")
 
     rows = workers_sheet.get_all_records()
 
@@ -266,93 +240,18 @@ def get_worker(user_id):
 
             return {
                 "telegram_user_id": str(row.get("telegram_user_id", "")).strip(),
-                "name": str(row.get("name", "")).strip(),
-                "username": str(row.get("username", "")).strip(),
-                "column": str(row.get("column", "")).strip().upper(),
+                "name": str(row.get("ПІБ", "")).strip(),
+                "role": str(row.get("роль", "")).strip(),
+                "brigade": str(row.get("бригада", "")).strip(),
             }
 
     return None
-def column_letter_to_number(column_letter):
-    result = 0
-
-    for char in column_letter.upper():
-        if char.isalpha():
-            result = result * 26 + (ord(char) - ord("A") + 1)
-
-    return result
-
-
-def parse_sheet_number(value):
-    if value is None:
-        return 0.0
-
-    text = str(value).strip().replace(",", ".")
-
-    if text == "" or text == "-":
-        return 0.0
-
-    try:
-        return float(text)
-    except ValueError:
-        return 0.0
-
-
-def find_date_row(worksheet, target_date):
-    dates = worksheet.col_values(2)  # колонка B
-
-    for row_number, value in enumerate(dates, start=1):
-        if str(value).strip() == target_date:
-            return row_number
-
-    return None
-
-
-def write_work_time_to_sheet(message, work_time, shift_start_time):
-    worker = get_worker(message.from_user.id)
-
-    if worker is None:
-        send_with_keyboard(
-            message,
-            "❌ Працівника не знайдено у вкладці workers або він не активний."
-        )
-        return False
-
-    worksheet = get_capture_sheet(message.chat.id)
-
-    if worksheet is None:
-        send_with_keyboard(
-            message,
-            "❌ Ця Telegram-група не привʼязана до захватки у вкладці captures."
-        )
-        return False
-
-    target_date = shift_start_time.strftime("%d.%m")
-    row_number = find_date_row(worksheet, target_date)
-
-    if row_number is None:
-        send_with_keyboard(
-            message,
-            f"❌ У вкладці {worksheet.title} не знайдено дату {target_date} у колонці B."
-        )
-        return False
-
-    column_number = column_letter_to_number(worker["column"])
-
-    hours = round(work_time.total_seconds() / 3600, 2)
-
-    existing_value = worksheet.cell(row_number, column_number).value
-    existing_hours = parse_sheet_number(existing_value)
-
-    total_hours = round(existing_hours + hours, 2)
-
-    worksheet.update_cell(row_number, column_number, total_hours)
-
-    return True
 users = {}
 
 START_SHIFT_TEXT = "Початок зміни"
 START_BREAK_TEXT = "Перерва"
 STOP_BREAK_TEXT = "Стоп перерви"
+SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
 
@@ -384,7 +283,7 @@ def main_keyboard():
         KeyboardButton(STOP_BREAK_TEXT),
         KeyboardButton(END_SHIFT_TEXT),
     )
-    markup.row(KeyboardButton(STATUS_TEXT))
+    markup.row(KeyboardButton(STATUS_TEXT), KeyboardButton(SELECT_CAPTURE_TEXT))
     return markup
 
 
@@ -407,6 +306,8 @@ def get_user(user_id, full_name):
             "break_active": False,
             "break_start_time": None,
             "total_break": timedelta(),
+            "selected_capture": None,
+            "shift_capture": None,
         },
     )
 
@@ -421,6 +322,34 @@ def send_with_keyboard(message, text):
     bot.send_message(message.chat.id, text, **send_options)
 
 
+def choose_capture(message):
+    captures = get_active_captures()
+    if not captures:
+        send_with_keyboard(message, "Немає активних захваток у таблиці «Well Place 2».")
+        return
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for capture in captures:
+        markup.row(KeyboardButton(capture["name"]))
+    markup.row(KeyboardButton("Скасувати вибір"))
+
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    bot.send_message(message.chat.id, "Оберіть захватку для наступної зміни:", **options)
+
+
+def select_capture(message, capture_name):
+    user = get_user(message.from_user.id, get_user_name(message))
+    for capture in get_active_captures():
+        if capture["name"] == capture_name:
+            user["selected_capture"] = capture
+            send_with_keyboard(message, f"Обрано захватку: {capture['name']}\nОбʼєкт: {capture['project']}")
+            return True
+    return False
+
+
 def start_shift(message):
     user = get_user(message.from_user.id, get_user_name(message))
 
@@ -431,15 +360,22 @@ def start_shift(message):
         )
         return
 
+    if not user.get("selected_capture"):
+        send_with_keyboard(message, "Спершу оберіть захватку кнопкою «Обрати захватку».")
+        return
+
     user["shift_started"] = True
     user["shift_start_time"] = now_dt()
     user["break_active"] = False
     user["break_start_time"] = None
     user["total_break"] = timedelta()
+    user["shift_capture"] = user["selected_capture"]
 
     send_with_keyboard(
         message,
-        f"{user['full_name']}\nПочаток зміни зафіксовано.\nЧас: {format_datetime(user['shift_start_time'])}",
+        f"{user['full_name']}\nПочаток зміни зафіксовано.\n"
+        f"Захватка: {user['shift_capture']['name']}\n"
+        f"Час: {format_datetime(user['shift_start_time'])}",
     )
 
 
@@ -517,11 +453,6 @@ def end_shift(message):
         total_time,
         work_time
     )
-    write_work_time_to_sheet(
-        message,
-        work_time,
-        user["shift_start_time"]
-    )
     summary = (
         f"{user['full_name']}\n"
         "Кінець зміни зафіксовано.\n\n"
@@ -537,6 +468,7 @@ def end_shift(message):
     user["break_active"] = False
     user["break_start_time"] = None
     user["total_break"] = timedelta()
+    user["shift_capture"] = None
 
     send_with_keyboard(message, summary)
     def show_status(message):
@@ -622,12 +554,20 @@ def handle_text(message):
         STOP_BREAK_TEXT: stop_break,
         END_SHIFT_TEXT: end_shift,
         STATUS_TEXT: show_status,
+        SELECT_CAPTURE_TEXT: choose_capture,
     }
 
     handler = commands_map.get(text)
 
     if handler:
         handler(message)
+        return
+
+    if text == "Скасувати вибір":
+        send_with_keyboard(message, "Вибір захватки скасовано.")
+        return
+
+    if select_capture(message, text):
         return
     
     if is_direct_message_to_bot(message):
