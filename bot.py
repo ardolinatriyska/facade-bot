@@ -504,6 +504,7 @@ def end_shift(message):
             )
 
         send_with_keyboard(message, status_text)
+@bot.message_handler(commands=["start"])
 def start_command(message):
     full_name = get_user_name(message)
     get_user(message.from_user.id, full_name)
