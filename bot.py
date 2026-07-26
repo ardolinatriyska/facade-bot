@@ -207,23 +207,25 @@ def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
     worker = get_worker(message.from_user.id) or {}
     spreadsheet = get_sheet()
     worksheet = spreadsheet.worksheet("Зміни")
+    if worksheet.row_values(1) != SHIFT_HEADERS:
+        worksheet.update("A1", [SHIFT_HEADERS])
 
     worksheet.append_row([
-        format_datetime(now_dt()),
         shift_end.strftime("%d.%m.%Y"),
-        str(message.chat.id),
-        str(message.from_user.id),
         worker.get("name") or user["full_name"],
         worker.get("role", ""),
-        worker.get("brigade", ""),
-        capture["project"],
+        format_duration(work_time),
         capture["name"],
+        capture["project"],
+        worker.get("brigade", ""),
         format_datetime(user["shift_start_time"]),
         format_datetime(shift_end),
         format_duration(total_time),
         format_duration(user["total_break"]),
-        format_duration(work_time),
         round(work_time.total_seconds() / 3600, 2),
+        str(message.from_user.id),
+        str(message.chat.id),
+        format_datetime(now_dt()),
     ])
 def get_worker(user_id):
     spreadsheet = get_sheet()
@@ -254,6 +256,24 @@ STOP_BREAK_TEXT = "Стоп перерви"
 SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
+
+SHIFT_HEADERS = [
+    "дата",
+    "працівник",
+    "роль",
+    "чистий час",
+    "захватка",
+    "обʼєкт",
+    "бригада",
+    "початок зміни",
+    "кінець зміни",
+    "загальна тривалість",
+    "перерви",
+    "години",
+    "telegram_user_id",
+    "telegram_chat_id",
+    "timestamp",
+]
 
 
 def now_dt():
