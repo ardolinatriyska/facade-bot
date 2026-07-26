@@ -615,20 +615,10 @@ def extend_movement_totals(worksheet, total_row, previous_last_data_row, new_las
 
 def get_daily_movement_row(worksheet, timestamp):
     """Return the visible daily row immediately after the existing records."""
-    last_column = column_letter(worksheet.col_count)
-    rows = worksheet.get(
-        f"A1:{last_column}200",
-        value_render_option="FORMULA",
-    )
-    total_row = next(
-        (
-            index
-            for index, row in enumerate(rows, start=1)
-            if index >= 5 and any(str(value or "").startswith("=SUM(") for value in row)
-        ),
-        201,
-    )
-    data_limit = total_row - 1
+    # Only the identity columns define the end of the journal. Material cells
+    # contain helper formulas, so they must not influence the destination row.
+    data_limit = 200
+    rows = worksheet.get("A1:D200")
     details = [
         (index, row[:4])
         for index, row in enumerate(rows[4:data_limit], start=5)
@@ -653,28 +643,16 @@ def get_daily_movement_row(worksheet, timestamp):
     for index in range(5, last_used + 1):
         row = detail_rows.get(index, [])
         if row and date_matches(row[0], timestamp):
-            return index, total_row
+            return index
 
-    return last_used + 1, total_row
+    return last_used + 1
 
 
 def sync_daily_material_movement(spreadsheet, message, material, operation, quantity, worker, timestamp):
     worksheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
     pending_updates = []
-    row_number, total_row = get_daily_movement_row(worksheet, timestamp)
-    if row_number >= total_row:
-        worksheet.insert_row([""] * worksheet.col_count, index=total_row)
-        extend_movement_totals(
-            worksheet,
-            total_row + 1,
-            total_row - 1,
-            total_row,
-        )
-        pending_updates.append({
-            "range": f"'{DAILY_MATERIAL_SHEET}'!A{row_number}",
-            "values": [[timestamp.strftime("%d.%m.%Y")]],
-        })
-    elif not worksheet.acell(f"A{row_number}").value:
+    row_number = get_daily_movement_row(worksheet, timestamp)
+    if not worksheet.acell(f"A{row_number}").value:
         pending_updates.append({
             "range": f"'{DAILY_MATERIAL_SHEET}'!A{row_number}",
             "values": [[timestamp.strftime("%d.%m.%Y")]],
