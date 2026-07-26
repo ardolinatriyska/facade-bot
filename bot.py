@@ -710,6 +710,18 @@ def find_material_candidates(text):
     return [row for _, row in candidates[:3]]
 
 
+def response_output_text(response):
+    """Return text from a raw Responses API payload (not the SDK convenience property)."""
+    direct_text = str(response.get("output_text") or "").strip()
+    if direct_text:
+        return direct_text
+    for output in response.get("output", []):
+        for content in output.get("content", []):
+            if content.get("type") == "output_text" and content.get("text"):
+                return str(content["text"])
+    raise ValueError("Відповідь OpenAI не містить тексту")
+
+
 def interpret_material_with_ai(text, catalog):
     """Turns a colloquial material request into a safe, structured suggestion.
 
@@ -763,7 +775,7 @@ def interpret_material_with_ai(text, catalog):
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             result = json.loads(response.read().decode("utf-8"))
-        output_text = result.get("output_text", "")
+        output_text = response_output_text(result)
         parsed = json.loads(output_text)
     except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
         return None
@@ -857,7 +869,7 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
-        parsed = json.loads(result.get("output_text", ""))
+        parsed = json.loads(response_output_text(result))
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"OpenAI API: {error.code}") from error
     except (urllib.error.URLError, ValueError, json.JSONDecodeError) as error:
