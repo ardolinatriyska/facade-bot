@@ -635,7 +635,10 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
                 row_number - 1,
                 row_number,
             )
-        worksheet.update(f"A{row_number}", [[timestamp.strftime("%d.%m.%Y")]])
+        worksheet.update(
+            values=[[timestamp.strftime("%d.%m.%Y")]],
+            range_name=f"A{row_number}",
+        )
 
     details = worksheet.get(f"B{row_number}:D{row_number}")
     details = details[0] if details else ["", "", ""]
@@ -649,12 +652,18 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
     details[0] = append_unique_text(details[0], side_label)
     details[1] = append_unique_text(details[1], "RAHUY Bot / склад")
     details[2] = append_unique_text(details[2], worker_name)
-    worksheet.update(f"B{row_number}:D{row_number}", [details])
+    worksheet.update(
+        values=[details],
+        range_name=f"B{row_number}:D{row_number}",
+    )
 
     column = get_daily_material_column(worksheet, material, operation)
     cell = f"{column_letter(column)}{row_number}"
     current_value = worksheet.acell(cell).value
-    worksheet.update(cell, [[parse_sheet_number(current_value) + quantity]])
+    worksheet.update(
+        values=[[parse_sheet_number(current_value) + quantity]],
+        range_name=cell,
+    )
     return row_number
 
 
