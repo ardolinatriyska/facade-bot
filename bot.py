@@ -375,7 +375,7 @@ def format_duration(duration):
 
 
 def main_keyboard():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(
         KeyboardButton(START_SHIFT_TEXT),
         KeyboardButton(START_BREAK_TEXT),
