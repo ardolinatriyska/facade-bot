@@ -7,7 +7,10 @@ load_dotenv()
 import json
 import re
 import base64
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from difflib import SequenceMatcher
 import gspread
@@ -27,6 +30,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MATERIALS_CHAT_ID = os.getenv("MATERIALS_CHAT_ID")
 MATERIALS_THREAD_ID = os.getenv("MATERIALS_THREAD_ID")
+
+# "Події" у WellPlaceBOT. Ця тема має ідентифікатор 1 у посиланні Telegram.
+WEATHER_CHAT_ID = -1004258418040
+WEATHER_THREAD_ID = 1
+WEATHER_LATITUDE = 49.8157
+WEATHER_LONGITUDE = 24.1346
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -330,6 +339,74 @@ SHIFT_HEADERS = [
 
 def now_dt():
     return datetime.now(KYIV_TZ)
+
+
+def get_vynnyky_weather_text():
+    """Return a compact hourly ECMWF forecast for the working part of the day."""
+    query = urllib.parse.urlencode({
+        "latitude": WEATHER_LATITUDE,
+        "longitude": WEATHER_LONGITUDE,
+        "hourly": "temperature_2m,wind_speed_10m,precipitation_probability",
+        "models": "ecmwf_ifs025",
+        "timezone": "Europe/Kyiv",
+        "forecast_days": 1,
+    })
+    request = urllib.request.Request(
+        f"https://api.open-meteo.com/v1/forecast?{query}",
+        headers={"User-Agent": "RAHUY-Bot/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    hourly = data.get("hourly", {})
+    today = now_dt().date().isoformat()
+    lines = []
+    for timestamp, temperature, wind, precipitation in zip(
+        hourly.get("time", []),
+        hourly.get("temperature_2m", []),
+        hourly.get("wind_speed_10m", []),
+        hourly.get("precipitation_probability", []),
+    ):
+        if not timestamp.startswith(today):
+            continue
+        hour = int(timestamp[11:13])
+        if 6 <= hour <= 21:
+            lines.append(
+                f"{hour:02d}:00 — {temperature:+.0f}°C | вітер {wind:.0f} км/год | опади {precipitation:.0f}%"
+            )
+
+    if not lines:
+        raise RuntimeError("Прогноз на сьогодні не отримано")
+
+    return (
+        "Доброго ранку! ☀️\n\n"
+        f"Погода у Винниках на {now_dt():%d.%m}:\n"
+        + "\n".join(lines)
+        + "\n\nВсім гарного робочого дня!"
+    )
+
+
+def weather_scheduler():
+    """Send one weekday forecast at 06:00 Kyiv time while the bot is running."""
+    last_sent_date = None
+    while True:
+        current = now_dt()
+        if (
+            current.weekday() != 6
+            and current.hour == 6
+            and current.minute < 5
+            and last_sent_date != current.date()
+        ):
+            try:
+                bot.send_message(
+                    WEATHER_CHAT_ID,
+                    get_vynnyky_weather_text(),
+                    message_thread_id=WEATHER_THREAD_ID,
+                )
+                last_sent_date = current.date()
+            except Exception as error:
+                print(f"Weather forecast failed: {error}")
+        time.sleep(30)
 
 
 def format_datetime(value):
@@ -1663,4 +1740,5 @@ def handle_materials_text(message, text):
 
 
 print("Bot is running...")
+threading.Thread(target=weather_scheduler, daemon=True).start()
 bot.infinity_polling(skip_pending=True)
