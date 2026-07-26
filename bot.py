@@ -5,6 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
+import re
+import urllib.error
+import urllib.request
+from difflib import SequenceMatcher
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -18,6 +22,10 @@ TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MATERIALS_CHAT_ID = os.getenv("MATERIALS_CHAT_ID")
+MATERIALS_THREAD_ID = os.getenv("MATERIALS_THREAD_ID")
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -256,6 +264,38 @@ STOP_BREAK_TEXT = "Стоп перерви"
 SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
+MATERIALS_TEXT = "Взяти матеріал"
+MATERIAL_CONFIRM_TEXT = "Підтвердити"
+MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
+
+MATERIAL_LOG_HEADERS = [
+    "дата", "операція", "матеріал", "кількість", "од. виміру",
+    "захватка", "працівник", "роль", "примітка", "telegram_user_id",
+    "telegram_chat_id", "timestamp",
+]
+
+MATERIAL_BALANCE_HEADERS = [
+    "матеріал", "од. виміру", "початковий залишок", "надійшло",
+    "видано", "поточний залишок",
+]
+
+SHIFT_HEADERS = [
+    "дата",
+    "працівник",
+    "роль",
+    "чистий час",
+    "захватка",
+    "обʼєкт",
+    "бригада",
+    "початок зміни",
+    "кінець зміни",
+    "загальна тривалість",
+    "перерви",
+    "години",
+    "telegram_user_id",
+    "telegram_chat_id",
+    "timestamp",
+]
 
 SHIFT_HEADERS = [
     "дата",
@@ -316,6 +356,22 @@ def main_keyboard():
     return markup
 
 
+def materials_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(KeyboardButton(MATERIALS_TEXT))
+    return markup
+
+
+def is_materials_topic(message):
+    """Material operations are permitted only in the configured Telegram topic."""
+    thread_id = getattr(message, "message_thread_id", None)
+    return (
+        bool(MATERIALS_CHAT_ID and MATERIALS_THREAD_ID)
+        and str(message.chat.id) == str(MATERIALS_CHAT_ID)
+        and str(thread_id) == str(MATERIALS_THREAD_ID)
+    )
+
+
 def get_user_name(message):
     first = message.from_user.first_name or ""
     last = message.from_user.last_name or ""
@@ -337,12 +393,14 @@ def get_user(user_id, full_name):
             "total_break": timedelta(),
             "selected_capture": None,
             "shift_capture": None,
+            "pending_material": None,
         },
     )
 
 
 def send_with_keyboard(message, text):
-    send_options = {"reply_markup": main_keyboard()}
+    keyboard = materials_keyboard() if is_materials_topic(message) else main_keyboard()
+    send_options = {"reply_markup": keyboard}
     thread_id = getattr(message, "message_thread_id", None)
 
     if thread_id is not None:
@@ -377,6 +435,288 @@ def select_capture(message, capture_name):
             send_with_keyboard(message, f"Обрано захватку: {capture['name']}\nОбʼєкт: {capture['project']}")
             return True
     return False
+
+
+def normalize_material_text(value):
+    value = str(value or "").lower().replace("ʼ", "'")
+    value = value.replace("-", " ")
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    return " ".join(value.split())
+
+
+def material_aliases(row):
+    aliases = str(row.get("Синоніми", "") or "")
+    aliases = aliases.replace("Синоніми:", "").replace("синоніми:", "")
+    return [normalize_material_text(alias) for alias in aliases.split(",") if alias.strip()]
+
+
+def get_material_catalog():
+    spreadsheet = get_sheet()
+    worksheet = spreadsheet.worksheet("Довідник матеріалів")
+    return [row for row in worksheet.get_all_records() if row.get("Матеріал")]
+
+
+def extract_material_quantity(text):
+    numeric_match = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    if numeric_match:
+        return float(numeric_match.group(1).replace(",", "."))
+
+    word_numbers = {
+        "один": 1, "одна": 1, "одне": 1, "два": 2, "дві": 2,
+        "три": 3, "чотири": 4, "пять": 5, "п'ять": 5,
+        "пятьох": 5, "шість": 6, "сім": 7, "вісім": 8,
+        "девять": 9, "дев'ять": 9, "десять": 10,
+    }
+    normalized = normalize_material_text(text)
+    for word, number in word_numbers.items():
+        if word in normalized.split():
+            return float(number)
+    return None
+
+
+def material_match_score(text, row):
+    normalized = normalize_material_text(text)
+    material_name = normalize_material_text(row.get("Матеріал", ""))
+    aliases = material_aliases(row)
+
+    if material_name and material_name in normalized:
+        return 1.0
+    if any(alias and alias in normalized for alias in aliases):
+        return 0.95
+
+    query_tokens = set(normalized.split())
+    name_tokens = set(material_name.split())
+    alias_tokens = set(" ".join(aliases).split())
+    meaningful_tokens = query_tokens - {
+        "взяв", "взяла", "взяли", "видати", "видай", "видав", "мені",
+        "будь", "ласка", "штук", "шт", "штуки", "балон", "балони",
+        "один", "одна", "два", "дві", "три", "чотири", "пять", "п'ять",
+    }
+    overlap = meaningful_tokens & (name_tokens | alias_tokens)
+    if not overlap:
+        return 0.0
+    token_score = len(overlap) / max(1, len(meaningful_tokens))
+    similarity = SequenceMatcher(None, normalized, material_name).ratio()
+    return max(token_score, similarity * 0.5)
+
+
+def find_material_candidates(text):
+    candidates = []
+    for row in get_material_catalog():
+        score = material_match_score(text, row)
+        if score >= 0.35:
+            candidates.append((score, row))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in candidates[:3]]
+
+
+def interpret_material_with_ai(text, catalog):
+    """Turns a colloquial material request into a safe, structured suggestion.
+
+    The result is only a suggestion. The Telegram confirmation step still decides
+    whether anything is written to the spreadsheet.
+    """
+    if not OPENAI_API_KEY or not catalog:
+        return None
+
+    materials = [
+        {
+            "name": str(row.get("Матеріал", "")),
+            "aliases": str(row.get("Синоніми", "")),
+            "unit": str(row.get("Од. виміру / примітка", "")),
+        }
+        for row in catalog
+        if row.get("Матеріал")
+    ]
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "operation": {"type": "string", "enum": ["Видача", "Надходження", "Невідомо"]},
+            "quantity": {"type": ["number", "null"]},
+            "material": {"type": ["string", "null"]},
+            "confidence": {"type": "number"},
+        },
+        "required": ["operation", "quantity", "material", "confidence"],
+    }
+    instructions = (
+        "Ти розпізнаєш короткі українські повідомлення працівників про рух матеріалів. "
+        "Обери material тільки як точну назву з каталогу. Використовуй синоніми лише для зіставлення. "
+        "Не вигадуй матеріал, кількість чи дію. Якщо даних недостатньо, поверни null або Невідомо. "
+        "Це лише пропозиція для подальшого підтвердження працівником."
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": json.dumps({"message": text, "catalog": materials}, ensure_ascii=False),
+        "text": {"format": {"type": "json_schema", "name": "material_operation", "strict": True, "schema": schema}},
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        output_text = result.get("output_text", "")
+        parsed = json.loads(output_text)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return None
+
+    material_name = parsed.get("material")
+    selected = next((row for row in catalog if row.get("Матеріал") == material_name), None)
+    if not selected or float(parsed.get("confidence", 0) or 0) < 0.65:
+        return None
+
+    quantity = parsed.get("quantity")
+    try:
+        quantity = float(quantity) if quantity is not None else None
+    except (TypeError, ValueError):
+        quantity = None
+    if quantity is None or quantity <= 0:
+        return None
+
+    operation = parsed.get("operation")
+    if operation not in ("Видача", "Надходження"):
+        operation = detect_material_operation(text)
+    return {"quantity": quantity, "operation": operation, "selected": selected}
+
+
+def detect_material_operation(text):
+    normalized = normalize_material_text(text)
+    if any(word in normalized for word in ("привіз", "привезли", "надійшло", "отримали на склад")):
+        return "Надходження"
+    return "Видача"
+
+
+def send_material_choice(message, text):
+    quantity = extract_material_quantity(text)
+    catalog = get_material_catalog()
+    candidates = []
+    if quantity is not None and quantity > 0:
+        candidates = find_material_candidates(text)
+
+    ai_result = None
+    if not candidates or len(candidates) > 1 or quantity is None:
+        ai_result = interpret_material_with_ai(text, catalog)
+        if ai_result:
+            quantity = ai_result["quantity"]
+            candidates = [ai_result["selected"]]
+
+    if quantity is None or quantity <= 0:
+        send_with_keyboard(
+            message,
+            "Не бачу кількості. Напишіть, наприклад: «взяв 5 кутиків» або «клей-піна 1 балон»."
+        )
+        return
+
+    if not candidates:
+        send_with_keyboard(
+            message,
+            "Не знайшов матеріал у довіднику. Напишіть назву точніше або додамо для нього синонім."
+        )
+        return
+
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {
+        "operation": ai_result["operation"] if ai_result else detect_material_operation(text),
+        "quantity": quantity,
+        "candidates": candidates,
+        "selected": None,
+    }
+
+    if len(candidates) == 1:
+        select_material_candidate(message, candidates[0].get("Матеріал", ""))
+        return
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for candidate in candidates:
+        markup.row(KeyboardButton(str(candidate.get("Матеріал", ""))))
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    bot.send_message(message.chat.id, "Уточніть матеріал:", **options)
+
+
+def select_material_candidate(message, material_name):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if not pending:
+        return False
+
+    selected = next(
+        (row for row in pending["candidates"] if row.get("Матеріал") == material_name),
+        None,
+    )
+    if not selected:
+        return False
+
+    pending["selected"] = selected
+    unit = selected.get("Од. виміру / примітка", "") or "од."
+    operation = pending["operation"].lower()
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(MATERIAL_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    bot.send_message(
+        message.chat.id,
+        f"{operation.capitalize()}: {pending['quantity']:g} {unit}\n"
+        f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?",
+        **options,
+    )
+    return True
+
+
+def save_material_operation(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if not pending or not pending.get("selected"):
+        send_with_keyboard(message, "Немає операції матеріалу для підтвердження.")
+        return
+
+    material = pending["selected"]
+    worker = get_worker(message.from_user.id) or {}
+    capture = user.get("selected_capture") or {}
+    spreadsheet = get_sheet()
+    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
+    timestamp = now_dt()
+    log_sheet.append_row([
+        timestamp.strftime("%d.%m.%Y"),
+        pending["operation"],
+        material["Матеріал"],
+        pending["quantity"],
+        material.get("Од. виміру / примітка", ""),
+        capture.get("name", ""),
+        worker.get("name") or user["full_name"],
+        worker.get("role", ""),
+        "",
+        str(message.from_user.id),
+        str(message.chat.id),
+        format_datetime(timestamp),
+    ])
+
+    user["pending_material"] = None
+    send_with_keyboard(
+        message,
+        f"Записано: {pending['operation'].lower()} — {pending['quantity']:g} "
+        f"{material.get('Од. виміру / примітка', '')}\nМатеріал: {material['Матеріал']}",
+    )
+
+
+def cancel_material_operation(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = None
+    send_with_keyboard(message, "Операцію з матеріалом скасовано.")
 
 
 def start_shift(message):
@@ -540,6 +880,13 @@ def end_shift(message):
         send_with_keyboard(message, status_text)
 @bot.message_handler(commands=["start"])
 def start_command(message):
+    if is_materials_topic(message):
+        send_with_keyboard(
+            message,
+            "Ви у гілці «Матеріали». Напишіть, що взяли або отримали, наприклад: «взяв 5 кутиків».",
+        )
+        return
+
     full_name = get_user_name(message)
     get_user(message.from_user.id, full_name)
 
@@ -557,32 +904,51 @@ def start_command(message):
 
 @bot.message_handler(commands=["work"])
 def work_command(message):
+    if is_materials_topic(message):
+        handle_materials_text(message, MATERIALS_TEXT)
+        return
     start_shift(message)
 
 
 @bot.message_handler(commands=["break"])
 def break_command(message):
+    if is_materials_topic(message):
+        handle_materials_text(message, MATERIALS_TEXT)
+        return
     start_break(message)
 
 
 @bot.message_handler(commands=["stop_break"])
 def stop_break_command(message):
+    if is_materials_topic(message):
+        handle_materials_text(message, MATERIALS_TEXT)
+        return
     stop_break(message)
 
 
 @bot.message_handler(commands=["stop"])
 def stop_command(message):
+    if is_materials_topic(message):
+        handle_materials_text(message, MATERIALS_TEXT)
+        return
     end_shift(message)
 
 
 @bot.message_handler(commands=["status"])
 def status_command(message):
+    if is_materials_topic(message):
+        handle_materials_text(message, MATERIALS_TEXT)
+        return
     show_status(message)
 
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     text = (message.text or "").strip()
+
+    if is_materials_topic(message):
+        handle_materials_text(message, text)
+        return
 
     commands_map = {
         START_SHIFT_TEXT: start_shift,
@@ -615,6 +981,41 @@ def handle_text(message):
             message,
             "Команда не розпізнана. Будь ласка, скористайтеся кнопками меню.",
         )
+
+
+def handle_materials_text(message, text):
+    if text == MATERIALS_TEXT:
+        send_with_keyboard(
+            message,
+            "Напишіть, що взяли або отримали. Наприклад: «взяв 5 кутиків» або «клей-піна 1 балон».",
+        )
+        return
+
+    if text == MATERIAL_CANCEL_TEXT:
+        cancel_material_operation(message)
+        return
+
+    if text == MATERIAL_CONFIRM_TEXT:
+        save_material_operation(message)
+        return
+
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if pending and select_material_candidate(message, text):
+        return
+
+    material_keywords = (
+        "взяв", "взяла", "взяли", "видати", "видай", "видав",
+        "привіз", "привезли", "надійшло", "отримали",
+    )
+    if any(keyword in normalize_material_text(text) for keyword in material_keywords):
+        send_material_choice(message, text)
+        return
+
+    send_with_keyboard(
+        message,
+        "Напишіть рух матеріалу, наприклад: «взяв 5 кутиків» або «привезли 10 балонів клей-піни».",
+    )
 
 
 print("Bot is running...")
