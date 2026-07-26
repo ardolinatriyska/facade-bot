@@ -293,6 +293,15 @@ def format_duration(duration):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def round_up_to_minute(duration, minimum_one_minute=False):
+    total_seconds = max(0, int(duration.total_seconds()))
+    if total_seconds == 0 and not minimum_one_minute:
+        return timedelta()
+
+    total_minutes = max(1, (total_seconds + 59) // 60)
+    return timedelta(minutes=total_minutes)
+
+
 def main_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(
@@ -464,8 +473,14 @@ def end_shift(message):
         user["break_active"] = False
         user["break_start_time"] = None
 
-    total_time = shift_end - user["shift_start_time"]
+    total_time = round_up_to_minute(
+        shift_end - user["shift_start_time"],
+        minimum_one_minute=True,
+    )
+    user["total_break"] = round_up_to_minute(user["total_break"])
     work_time = total_time - user["total_break"]
+    if work_time <= timedelta():
+        work_time = timedelta(minutes=1)
     save_shift_to_sheet(
         message,
         user,
