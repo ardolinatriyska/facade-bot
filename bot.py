@@ -613,29 +613,68 @@ def extend_movement_totals(worksheet, total_row, previous_last_data_row, new_las
         worksheet.batch_update(updates, value_input_option="USER_ENTERED")
 
 
+def get_daily_movement_row(worksheet, timestamp):
+    """Return the visible daily row immediately after the existing records."""
+    last_column = column_letter(worksheet.col_count)
+    rows = worksheet.get(
+        f"A1:{last_column}200",
+        value_render_option="FORMULA",
+    )
+    total_row = next(
+        (
+            index
+            for index, row in enumerate(rows, start=1)
+            if index >= 5 and any(str(value or "").startswith("=SUM(") for value in row)
+        ),
+        201,
+    )
+    data_limit = total_row - 1
+    details = [
+        (index, row[:4])
+        for index, row in enumerate(rows[4:data_limit], start=5)
+    ]
+
+    def row_has_data(row):
+        return any(str(value or "").strip() for value in row)
+
+    def is_bot_row(row):
+        return any("RAHUY Bot" in str(value or "") for value in row[1:4])
+
+    human_rows = [index for index, row in details if row_has_data(row) and not is_bot_row(row)]
+    last_used = max(human_rows, default=4)
+    detail_rows = dict(details)
+    while last_used + 1 <= data_limit:
+        next_row = detail_rows.get(last_used + 1, [])
+        if row_has_data(next_row) and is_bot_row(next_row):
+            last_used += 1
+        else:
+            break
+
+    for index in range(5, last_used + 1):
+        row = detail_rows.get(index, [])
+        if row and date_matches(row[0], timestamp):
+            return index, total_row
+
+    return last_used + 1, total_row
+
+
 def sync_daily_material_movement(spreadsheet, message, material, operation, quantity, worker, timestamp):
     worksheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
     pending_updates = []
-    date_values = worksheet.col_values(1)
-    row_number = next(
-        (index for index, value in enumerate(date_values, start=1) if index >= 5 and date_matches(value, timestamp)),
-        None,
-    )
-    if row_number is None:
-        dated_rows = [
-            index for index, value in enumerate(date_values, start=1)
-            if index >= 5 and str(value or "").strip()
-        ]
-        row_number = max(dated_rows, default=4) + 1
-        row_formulas = worksheet.row_values(row_number, value_render_option="FORMULA")
-        if any(str(value).startswith("=SUM(") for value in row_formulas):
-            worksheet.insert_row([""] * worksheet.col_count, index=row_number)
-            extend_movement_totals(
-                worksheet,
-                row_number + 1,
-                row_number - 1,
-                row_number,
-            )
+    row_number, total_row = get_daily_movement_row(worksheet, timestamp)
+    if row_number >= total_row:
+        worksheet.insert_row([""] * worksheet.col_count, index=total_row)
+        extend_movement_totals(
+            worksheet,
+            total_row + 1,
+            total_row - 1,
+            total_row,
+        )
+        pending_updates.append({
+            "range": f"'{DAILY_MATERIAL_SHEET}'!A{row_number}",
+            "values": [[timestamp.strftime("%d.%m.%Y")]],
+        })
+    elif not worksheet.acell(f"A{row_number}").value:
         pending_updates.append({
             "range": f"'{DAILY_MATERIAL_SHEET}'!A{row_number}",
             "values": [[timestamp.strftime("%d.%m.%Y")]],
