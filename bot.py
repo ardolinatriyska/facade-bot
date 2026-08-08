@@ -217,12 +217,13 @@ def get_active_captures():
     return captures
 
 
-def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
+def save_shift_to_sheet(message, user, shift_end, total_time, work_time, worker=None):
     capture = user.get("shift_capture")
     if not capture:
         raise ValueError("Не вибрано захватку для зміни")
 
-    worker = get_worker(message.from_user.id) or {}
+    worker = worker or get_worker(message.from_user.id) or {}
+    worker_user_id = worker.get("telegram_user_id") or message.from_user.id
     spreadsheet = get_sheet()
     worksheet = spreadsheet.worksheet("Зміни")
     if worksheet.row_values(1) != SHIFT_HEADERS:
@@ -241,10 +242,12 @@ def save_shift_to_sheet(message, user, shift_end, total_time, work_time):
         format_duration(total_time),
         format_duration(user["total_break"]),
         round(work_time.total_seconds() / 3600, 2),
-        str(message.from_user.id),
+        str(worker_user_id),
         str(message.chat.id),
         format_datetime(now_dt()),
     ])
+
+
 def get_worker(user_id):
     spreadsheet = get_sheet()
     workers_sheet = spreadsheet.worksheet("Працівники")
@@ -266,6 +269,29 @@ def get_worker(user_id):
             }
 
     return None
+
+
+def get_active_workers():
+    spreadsheet = get_sheet()
+    workers_sheet = spreadsheet.worksheet("Працівники")
+    workers = []
+
+    for row in workers_sheet.get_all_records():
+        user_id = str(row.get("telegram_user_id", "")).strip()
+        name = str(row.get("ПІБ", "")).strip()
+        active = str(row.get("active", "")).strip().upper()
+        if active != "TRUE" or not user_id or not name:
+            continue
+        workers.append({
+            "telegram_user_id": user_id,
+            "name": name,
+            "role": str(row.get("роль", "")).strip(),
+            "brigade": str(row.get("бригада", "")).strip(),
+        })
+
+    return workers
+
+
 users = {}
 
 START_SHIFT_TEXT = "Початок зміни"
@@ -281,6 +307,9 @@ MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
 INVENTORY_CONFIRM_TEXT = "Підтвердити інвентаризацію"
 INVOICE_CONFIRM_TEXT = "Підтвердити накладну"
+MATERIAL_OTHER_MASTER_TEXT = "Взяв інший майстер"
+MARK_FOR_MASTER_TEXT = "Позначити за майстра"
+DELEGATE_CANCEL_TEXT = "Скасувати позначення"
 
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
@@ -339,6 +368,21 @@ SHIFT_HEADERS = [
 
 def now_dt():
     return datetime.now(KYIV_TZ)
+
+
+def parse_operation_datetime(value):
+    text = str(value or "").strip()
+    for date_format in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, date_format).replace(tzinfo=KYIV_TZ)
+        except ValueError:
+            pass
+
+    try:
+        entered_time = datetime.strptime(text, "%H:%M").time()
+        return datetime.combine(now_dt().date(), entered_time, tzinfo=KYIV_TZ)
+    except ValueError as error:
+        raise ValueError("Невірний формат дати й часу") from error
 
 
 def get_vynnyky_weather_text():
@@ -442,6 +486,7 @@ def main_keyboard():
         KeyboardButton(END_SHIFT_TEXT),
     )
     markup.row(KeyboardButton(STATUS_TEXT), KeyboardButton(SELECT_CAPTURE_TEXT))
+    markup.row(KeyboardButton(MARK_FOR_MASTER_TEXT))
     return markup
 
 
@@ -449,6 +494,7 @@ def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(INVENTORY_TEXT))
     markup.row(KeyboardButton(BALANCE_TEXT))
+    markup.row(KeyboardButton(MATERIAL_OTHER_MASTER_TEXT))
     return markup
 
 
@@ -472,8 +518,9 @@ def get_user_name(message):
 
 
 def get_user(user_id, full_name):
+    user_key = str(user_id)
     return users.setdefault(
-        user_id,
+        user_key,
         {
             "full_name": full_name,
             "shift_started": False,
@@ -484,19 +531,73 @@ def get_user(user_id, full_name):
             "selected_capture": None,
             "shift_capture": None,
             "pending_material": None,
+            "pending_delegate": None,
+            "material_for_worker": None,
         },
     )
 
 
-def send_with_keyboard(message, text):
-    keyboard = materials_keyboard() if is_materials_topic(message) else main_keyboard()
-    send_options = {"reply_markup": keyboard}
+def send_with_markup(message, text, markup):
+    send_options = {"reply_markup": markup}
     thread_id = getattr(message, "message_thread_id", None)
 
     if thread_id is not None:
         send_options["message_thread_id"] = thread_id
 
     bot.send_message(message.chat.id, text, **send_options)
+
+
+def send_with_keyboard(message, text):
+    keyboard = materials_keyboard() if is_materials_topic(message) else main_keyboard()
+    send_with_markup(message, text, keyboard)
+
+
+def worker_button_text(worker):
+    return f"{worker['name']} | {worker['telegram_user_id']}"
+
+
+def find_worker_option(text, workers):
+    normalized = str(text or "").strip().lower()
+    for worker in workers:
+        if normalized in {
+            worker_button_text(worker).lower(),
+            str(worker["telegram_user_id"]).lower(),
+            worker["name"].lower(),
+        }:
+            return worker
+    return None
+
+
+def send_worker_selection(message, kind):
+    workers = get_active_workers()
+    if not workers:
+        send_with_keyboard(message, "У таблиці «Працівники» немає активних працівників із Telegram ID.")
+        return
+
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_delegate"] = {
+        "kind": kind,
+        "stage": "worker",
+        "workers": workers,
+    }
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for worker in workers:
+        markup.row(KeyboardButton(worker_button_text(worker)))
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    prompt = (
+        "Оберіть, хто взяв матеріал:"
+        if kind == "material"
+        else "Оберіть майстра або працівника, за якого потрібно позначити подію:"
+    )
+    send_with_markup(message, prompt, markup)
+
+
+def delegate_action_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(START_SHIFT_TEXT), KeyboardButton(END_SHIFT_TEXT))
+    markup.row(KeyboardButton(START_BREAK_TEXT), KeyboardButton(STOP_BREAK_TEXT))
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    return markup
 
 
 def choose_capture(message):
@@ -1018,13 +1119,16 @@ def send_material_choice(message, text):
         return
 
     user = get_user(message.from_user.id, get_user_name(message))
+    target_worker = user.get("material_for_worker")
     user["pending_material"] = {
         "kind": "material",
         "operation": ai_result["operation"] if ai_result else detect_material_operation(text),
         "quantity": quantity,
         "candidates": candidates,
         "selected": None,
+        "worker": target_worker,
     }
+    user["material_for_worker"] = None
 
     if len(candidates) == 1:
         select_material_candidate(message, candidates[0].get("Матеріал", ""))
@@ -1063,6 +1167,9 @@ def select_material_candidate(message, material_name):
 
     pending["selected"] = selected
     unit = selected.get("Од. виміру / примітка", "") or "од."
+    worker_line = ""
+    if pending.get("worker"):
+        worker_line = f"\nПрацівник: {pending['worker']['name']}"
     if pending.get("kind") == "inventory":
         markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         markup.row(KeyboardButton(INVENTORY_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
@@ -1073,7 +1180,7 @@ def select_material_candidate(message, material_name):
         bot.send_message(
             message.chat.id,
             f"Інвентаризація: фактичний залишок {pending['quantity']:g} {unit}\n"
-            f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?",
+            f"Матеріал: {selected['Матеріал']}{worker_line}\n\nПідтвердити запис?",
             **options,
         )
         return True
@@ -1088,7 +1195,7 @@ def select_material_candidate(message, material_name):
     bot.send_message(
         message.chat.id,
         f"{operation.capitalize()}: {pending['quantity']:g} {unit}\n"
-        f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?",
+        f"Матеріал: {selected['Матеріал']}{worker_line}\n\nПідтвердити запис?",
         **options,
     )
     return True
@@ -1102,8 +1209,12 @@ def save_material_operation(message):
         return
 
     material = pending["selected"]
-    worker = get_worker(message.from_user.id) or {}
-    capture = user.get("selected_capture") or {}
+    worker = pending.get("worker") or get_worker(message.from_user.id) or {}
+    target_user = get_user(
+        worker.get("telegram_user_id") or message.from_user.id,
+        worker.get("name") or user["full_name"],
+    )
+    capture = target_user.get("selected_capture") or user.get("selected_capture") or {}
     spreadsheet = get_sheet()
     timestamp = now_dt()
     sync_daily_material_movement(
@@ -1126,7 +1237,7 @@ def save_material_operation(message):
         worker.get("name") or user["full_name"],
         worker.get("role", ""),
         "",
-        str(message.from_user.id),
+        str(worker.get("telegram_user_id") or message.from_user.id),
         str(message.chat.id),
         format_datetime(timestamp),
     ])
@@ -1135,7 +1246,8 @@ def save_material_operation(message):
     send_with_keyboard(
         message,
         f"Записано: {pending['operation'].lower()} — {pending['quantity']:g} "
-        f"{material.get('Од. виміру / примітка', '')}\nМатеріал: {material['Матеріал']}",
+        f"{material.get('Од. виміру / примітка', '')}\nМатеріал: {material['Матеріал']}\n"
+        f"Працівник: {worker.get('name') or user['full_name']}",
     )
 
 
@@ -1405,11 +1517,151 @@ def save_invoice_delivery(message):
 def cancel_material_operation(message):
     user = get_user(message.from_user.id, get_user_name(message))
     user["pending_material"] = None
+    user["material_for_worker"] = None
+    pending_delegate = user.get("pending_delegate") or {}
+    if pending_delegate.get("kind") == "material":
+        user["pending_delegate"] = None
     send_with_keyboard(message, "Операцію з матеріалом скасовано.")
 
 
-def start_shift(message):
+def cancel_delegate(message):
     user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_delegate"] = None
+    user["material_for_worker"] = None
+    send_with_keyboard(message, "Позначення за іншого працівника скасовано.")
+
+
+def send_operation_time_prompt(message, worker, action):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    send_with_markup(
+        message,
+        f"Працівник: {worker['name']}\n"
+        f"Подія: {action}\n\n"
+        "Введіть фактичні дату й час події.\n"
+        "Формати: 08.08.2026 08:00, 2026-08-08 08:00 або 08:00 для сьогодні.",
+        markup,
+    )
+
+
+def handle_delegate_text(message, text):
+    actor = get_user(message.from_user.id, get_user_name(message))
+    pending = actor.get("pending_delegate")
+    if not pending:
+        return False
+
+    if text == DELEGATE_CANCEL_TEXT:
+        cancel_delegate(message)
+        return True
+
+    if pending["stage"] == "worker":
+        worker = find_worker_option(text, pending["workers"])
+        if not worker:
+            send_worker_selection(message, pending["kind"])
+            return True
+        pending["worker"] = worker
+        if pending["kind"] == "material":
+            pending["stage"] = "material"
+            actor["material_for_worker"] = worker
+            send_with_keyboard(
+                message,
+                f"Обрано: {worker['name']}.\n"
+                "Тепер напишіть матеріал і кількість, наприклад: «взяв 5 кутиків».",
+            )
+            return True
+
+        pending["stage"] = "action"
+        send_with_markup(
+            message,
+            f"Що потрібно позначити для {worker['name']}?",
+            delegate_action_keyboard(),
+        )
+        return True
+
+    if pending["kind"] == "material" and pending["stage"] == "material":
+        send_material_choice(message, text)
+        if actor.get("pending_material"):
+            actor["pending_delegate"] = None
+        return True
+
+    if pending["stage"] == "action":
+        actions = {START_SHIFT_TEXT, END_SHIFT_TEXT, START_BREAK_TEXT, STOP_BREAK_TEXT}
+        if text not in actions:
+            send_with_markup(message, "Оберіть подію кнопкою.", delegate_action_keyboard())
+            return True
+        pending["action"] = text
+        pending["stage"] = "datetime"
+        send_operation_time_prompt(message, pending["worker"], text)
+        return True
+
+    if pending["stage"] == "datetime":
+        try:
+            operation_time = parse_operation_datetime(text)
+        except ValueError:
+            send_operation_time_prompt(message, pending["worker"], pending["action"])
+            return True
+        if operation_time > now_dt() + timedelta(minutes=1):
+            send_with_keyboard(message, "Не можна вказати час у майбутньому. Введіть фактичний минулий час.")
+            return True
+
+        pending["operation_time"] = operation_time
+        if pending["action"] == START_SHIFT_TEXT:
+            captures = get_active_captures()
+            if not captures:
+                actor["pending_delegate"] = None
+                send_with_keyboard(message, "Немає активних захваток у таблиці «Захватки».")
+                return True
+            pending["captures"] = captures
+            pending["stage"] = "capture"
+            markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            for capture in captures:
+                markup.row(KeyboardButton(capture["name"]))
+            markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+            send_with_markup(message, "Оберіть захватку для цієї зміни:", markup)
+            return True
+
+        actor["pending_delegate"] = None
+        action = pending["action"]
+        worker = pending["worker"]
+        if action == END_SHIFT_TEXT:
+            end_shift(message, worker, operation_time)
+        elif action == START_BREAK_TEXT:
+            start_break(message, worker, operation_time)
+        else:
+            stop_break(message, worker, operation_time)
+        return True
+
+    if pending["stage"] == "capture":
+        capture = next(
+            (item for item in pending["captures"] if item["name"] == text),
+            None,
+        )
+        if not capture:
+            send_with_keyboard(message, "Захватку не знайдено. Оберіть її кнопкою або скасуйте операцію.")
+            return True
+        actor["pending_delegate"] = None
+        start_shift(message, pending["worker"], pending["operation_time"], capture)
+        return True
+
+    return False
+
+
+def get_shift_subject(message, target_worker=None):
+    worker = target_worker or get_worker(message.from_user.id) or {
+        "telegram_user_id": str(message.from_user.id),
+        "name": get_user_name(message),
+        "role": "",
+        "brigade": "",
+    }
+    user = get_user(
+        worker.get("telegram_user_id") or message.from_user.id,
+        worker.get("name") or get_user_name(message),
+    )
+    return worker, user
+
+
+def start_shift(message, target_worker=None, operation_time=None, capture=None):
+    worker, user = get_shift_subject(message, target_worker)
 
     if user["shift_started"]:
         send_with_keyboard(
@@ -1418,12 +1670,19 @@ def start_shift(message):
         )
         return
 
+    if capture:
+        user["selected_capture"] = capture
     if not user.get("selected_capture"):
         send_with_keyboard(message, "Спершу оберіть захватку кнопкою «Обрати захватку».")
         return
 
+    shift_start = operation_time or now_dt()
+    if shift_start > now_dt() + timedelta(minutes=1):
+        send_with_keyboard(message, "Початок зміни не може бути в майбутньому.")
+        return
+
     user["shift_started"] = True
-    user["shift_start_time"] = now_dt()
+    user["shift_start_time"] = shift_start
     user["break_active"] = False
     user["break_start_time"] = None
     user["total_break"] = timedelta()
@@ -1437,8 +1696,8 @@ def start_shift(message):
     )
 
 
-def start_break(message):
-    user = get_user(message.from_user.id, get_user_name(message))
+def start_break(message, target_worker=None, operation_time=None):
+    worker, user = get_shift_subject(message, target_worker)
 
     if not user["shift_started"]:
         send_with_keyboard(
@@ -1454,8 +1713,16 @@ def start_break(message):
         )
         return
 
+    break_start = operation_time or now_dt()
+    if break_start < user["shift_start_time"]:
+        send_with_keyboard(message, "Початок перерви не може бути раніше початку зміни.")
+        return
+    if break_start > now_dt() + timedelta(minutes=1):
+        send_with_keyboard(message, "Початок перерви не може бути в майбутньому.")
+        return
+
     user["break_active"] = True
-    user["break_start_time"] = now_dt()
+    user["break_start_time"] = break_start
 
     send_with_keyboard(
         message,
@@ -1463,8 +1730,8 @@ def start_break(message):
     )
 
 
-def stop_break(message):
-    user = get_user(message.from_user.id, get_user_name(message))
+def stop_break(message, target_worker=None, operation_time=None):
+    worker, user = get_shift_subject(message, target_worker)
 
     if not user["shift_started"]:
         send_with_keyboard(message, "Зміна ще не розпочата.")
@@ -1474,7 +1741,13 @@ def stop_break(message):
         send_with_keyboard(message, "Активної перерви зараз немає.")
         return
 
-    break_end = now_dt()
+    break_end = operation_time or now_dt()
+    if break_end < user["break_start_time"]:
+        send_with_keyboard(message, "Кінець перерви не може бути раніше її початку.")
+        return
+    if break_end > now_dt() + timedelta(minutes=1):
+        send_with_keyboard(message, "Кінець перерви не може бути в майбутньому.")
+        return
     break_duration = break_end - user["break_start_time"]
     user["total_break"] += break_duration
     user["break_active"] = False
@@ -1488,16 +1761,25 @@ def stop_break(message):
     )
 
 
-def end_shift(message):
-    user = get_user(message.from_user.id, get_user_name(message))
+def end_shift(message, target_worker=None, operation_time=None):
+    worker, user = get_shift_subject(message, target_worker)
 
     if not user["shift_started"] or user["shift_start_time"] is None:
         send_with_keyboard(message, "Немає активної зміни для завершення.")
         return
 
-    shift_end = now_dt()
+    shift_end = operation_time or now_dt()
+    if shift_end < user["shift_start_time"]:
+        send_with_keyboard(message, "Кінець зміни не може бути раніше її початку.")
+        return
+    if shift_end > now_dt() + timedelta(minutes=1):
+        send_with_keyboard(message, "Кінець зміни не може бути в майбутньому.")
+        return
 
     if user["break_active"] and user["break_start_time"] is not None:
+        if shift_end < user["break_start_time"]:
+            send_with_keyboard(message, "Кінець зміни не може бути раніше початку перерви.")
+            return
         user["total_break"] += shift_end - user["break_start_time"]
         user["break_active"] = False
         user["break_start_time"] = None
@@ -1515,7 +1797,8 @@ def end_shift(message):
         user,
         shift_end,
         total_time,
-        work_time
+        work_time,
+        worker,
     )
     summary = (
         f"{user['full_name']}\n"
@@ -1644,6 +1927,9 @@ def handle_text(message):
         handle_materials_text(message, text)
         return
 
+    if handle_delegate_text(message, text):
+        return
+
     commands_map = {
         START_SHIFT_TEXT: start_shift,
         START_BREAK_TEXT: start_break,
@@ -1651,6 +1937,7 @@ def handle_text(message):
         END_SHIFT_TEXT: end_shift,
         STATUS_TEXT: show_status,
         SELECT_CAPTURE_TEXT: choose_capture,
+        MARK_FOR_MASTER_TEXT: lambda current_message: send_worker_selection(current_message, "shift"),
     }
 
     handler = commands_map.get(text)
@@ -1678,6 +1965,13 @@ def handle_text(message):
 
 
 def handle_materials_text(message, text):
+    if handle_delegate_text(message, text):
+        return
+
+    if text == MATERIAL_OTHER_MASTER_TEXT:
+        send_worker_selection(message, "material")
+        return
+
     if text == BALANCE_TEXT:
         start_balance_check(message)
         return
