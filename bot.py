@@ -600,6 +600,18 @@ def delegate_action_keyboard():
     return markup
 
 
+def send_material_for_worker_prompt(message, worker, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Введіть матеріал і кількість, які взяв «{worker['name']}».\n"
+        "Наприклад: 5 кутиків або клей-піна 1 балон.",
+        markup,
+    )
+
+
 def choose_capture(message):
     captures = get_active_captures()
     if not captures:
@@ -851,12 +863,20 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
     details = details[0] if details else ["", "", ""]
     details += [""] * (3 - len(details))
     worker_name = worker.get("name") or get_user_name(message)
-    side_label = {
-        "Видача": "Видача через RAHUY Bot",
-        "Надходження": "Приймання через RAHUY Bot",
-        "Замовлення": "Замовлення через RAHUY Bot",
-    }[operation]
-    details[0] = append_unique_text(details[0], side_label)
+    if operation == "Видача":
+        actor_worker = get_worker(message.from_user.id) or {}
+        actor_id = str(actor_worker.get("telegram_user_id") or message.from_user.id)
+        target_id = str(worker.get("telegram_user_id") or message.from_user.id)
+        issued_by = "RAHUY"
+        if actor_id != target_id:
+            issued_by = actor_worker.get("name") or get_user_name(message)
+        details[0] = append_unique_text(details[0], issued_by)
+    else:
+        side_label = {
+            "Надходження": "Приймання через RAHUY Bot",
+            "Замовлення": "Замовлення через RAHUY Bot",
+        }[operation]
+        details[0] = append_unique_text(details[0], side_label)
     details[1] = append_unique_text(details[1], "RAHUY Bot / склад")
     details[2] = append_unique_text(details[2], worker_name)
     column = get_daily_material_column(worksheet, material, operation)
@@ -1090,7 +1110,9 @@ def detect_material_operation(text):
     return "Видача"
 
 
-def send_material_choice(message, text):
+def send_material_choice(message, text, forced_operation=None):
+    user = get_user(message.from_user.id, get_user_name(message))
+    target_worker = user.get("material_for_worker")
     quantity = extract_material_quantity(text)
     catalog = get_material_catalog()
     candidates = []
@@ -1105,24 +1127,29 @@ def send_material_choice(message, text):
             candidates = [ai_result["selected"]]
 
     if quantity is None or quantity <= 0:
-        send_with_keyboard(
-            message,
-            "Не бачу кількості. Напишіть, наприклад: «взяв 5 кутиків» або «клей-піна 1 балон»."
-        )
-        return
+        error_text = "Не бачу кількості."
+        if target_worker:
+            send_material_for_worker_prompt(message, target_worker, error_text)
+        else:
+            send_with_keyboard(
+                message,
+                f"{error_text} Напишіть, наприклад: «взяв 5 кутиків» або «клей-піна 1 балон»."
+            )
+        return False
 
     if not candidates:
-        send_with_keyboard(
-            message,
-            "Не знайшов матеріал у довіднику. Напишіть назву точніше або додамо для нього синонім."
-        )
-        return
+        error_text = "Не знайшов матеріал у довіднику. Напишіть назву точніше."
+        if target_worker:
+            send_material_for_worker_prompt(message, target_worker, error_text)
+        else:
+            send_with_keyboard(message, error_text + " Або додамо для нього синонім.")
+        return False
 
-    user = get_user(message.from_user.id, get_user_name(message))
-    target_worker = user.get("material_for_worker")
     user["pending_material"] = {
         "kind": "material",
-        "operation": ai_result["operation"] if ai_result else detect_material_operation(text),
+        "operation": forced_operation or (
+            ai_result["operation"] if ai_result else detect_material_operation(text)
+        ),
         "quantity": quantity,
         "candidates": candidates,
         "selected": None,
@@ -1132,7 +1159,7 @@ def send_material_choice(message, text):
 
     if len(candidates) == 1:
         select_material_candidate(message, candidates[0].get("Матеріал", ""))
-        return
+        return True
 
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     for candidate in candidates:
@@ -1150,6 +1177,7 @@ def send_material_choice(message, text):
         f"Уточніть матеріал — оберіть кнопку або надішліть точну назву:\n{visible_options}",
         **options,
     )
+    return True
 
 
 def select_material_candidate(message, material_name):
@@ -1185,19 +1213,26 @@ def select_material_candidate(message, material_name):
         )
         return True
 
-    operation = pending["operation"].lower()
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.row(KeyboardButton(MATERIAL_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
     options = {"reply_markup": markup}
     thread_id = getattr(message, "message_thread_id", None)
     if thread_id is not None:
         options["message_thread_id"] = thread_id
-    bot.send_message(
-        message.chat.id,
-        f"{operation.capitalize()}: {pending['quantity']:g} {unit}\n"
-        f"Матеріал: {selected['Матеріал']}{worker_line}\n\nПідтвердити запис?",
-        **options,
-    )
+    if pending.get("worker"):
+        confirmation_text = (
+            f"Майстер: {pending['worker']['name']}\n"
+            f"Матеріал: {selected['Матеріал']}\n"
+            f"Кількість: {pending['quantity']:g} {unit}\n"
+            f"Операція: {pending['operation']}\n\n"
+            "Підтвердити запис?"
+        )
+    else:
+        confirmation_text = (
+            f"{pending['operation']}: {pending['quantity']:g} {unit}\n"
+            f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?"
+        )
+    bot.send_message(message.chat.id, confirmation_text, **options)
     return True
 
 
@@ -1563,11 +1598,7 @@ def handle_delegate_text(message, text):
         if pending["kind"] == "material":
             pending["stage"] = "material"
             actor["material_for_worker"] = worker
-            send_with_keyboard(
-                message,
-                f"Обрано: {worker['name']}.\n"
-                "Тепер напишіть матеріал і кількість, наприклад: «взяв 5 кутиків».",
-            )
+            send_material_for_worker_prompt(message, worker)
             return True
 
         pending["stage"] = "action"
@@ -1579,8 +1610,8 @@ def handle_delegate_text(message, text):
         return True
 
     if pending["kind"] == "material" and pending["stage"] == "material":
-        send_material_choice(message, text)
-        if actor.get("pending_material"):
+        material_started = send_material_choice(message, text, forced_operation="Видача")
+        if material_started:
             actor["pending_delegate"] = None
         return True
 
