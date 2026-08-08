@@ -217,13 +217,23 @@ def get_active_captures():
     return captures
 
 
-def save_shift_to_sheet(message, user, shift_end, total_time, work_time, worker=None):
+def save_shift_to_sheet(
+    message,
+    user,
+    shift_end,
+    total_time,
+    work_time,
+    worker=None,
+    chat_id=None,
+):
     capture = user.get("shift_capture")
     if not capture:
         raise ValueError("Не вибрано захватку для зміни")
 
-    worker = worker or get_worker(message.from_user.id) or {}
-    worker_user_id = worker.get("telegram_user_id") or message.from_user.id
+    message_user_id = message.from_user.id if message is not None else ""
+    worker = worker or get_worker(message_user_id) or {}
+    worker_user_id = worker.get("telegram_user_id") or message_user_id
+    chat_id = chat_id if chat_id is not None else message.chat.id
     spreadsheet = get_sheet()
     worksheet = spreadsheet.worksheet("Зміни")
     if worksheet.row_values(1) != SHIFT_HEADERS:
@@ -243,7 +253,7 @@ def save_shift_to_sheet(message, user, shift_end, total_time, work_time, worker=
         format_duration(user["total_break"]),
         round(work_time.total_seconds() / 3600, 2),
         str(worker_user_id),
-        str(message.chat.id),
+        str(chat_id),
         format_datetime(now_dt()),
     ])
 
@@ -293,6 +303,8 @@ def get_active_workers():
 
 
 users = {}
+
+AUTO_SHIFT_END_HOUR = 18
 
 START_SHIFT_TEXT = "Початок зміни"
 START_BREAK_TEXT = "Перерва"
@@ -542,6 +554,10 @@ def get_user(user_id, full_name):
             "total_break": timedelta(),
             "selected_capture": None,
             "shift_capture": None,
+            "shift_worker": None,
+            "shift_chat_id": None,
+            "shift_thread_id": None,
+            "auto_close_in_progress": False,
             "pending_material": None,
             "pending_delegate": None,
             "material_for_worker": None,
@@ -1970,6 +1986,9 @@ def start_shift(message, target_worker=None, operation_time=None, capture=None):
     user["break_start_time"] = None
     user["total_break"] = timedelta()
     user["shift_capture"] = user["selected_capture"]
+    user["shift_worker"] = dict(worker)
+    user["shift_chat_id"] = message.chat.id
+    user["shift_thread_id"] = getattr(message, "message_thread_id", None)
 
     send_with_keyboard(
         message,
@@ -2044,25 +2063,10 @@ def stop_break(message, target_worker=None, operation_time=None):
     )
 
 
-def end_shift(message, target_worker=None, operation_time=None):
-    worker, user = get_shift_subject(message, target_worker)
-
-    if not user["shift_started"] or user["shift_start_time"] is None:
-        send_with_keyboard(message, "Немає активної зміни для завершення.")
-        return
-
-    shift_end = operation_time or now_dt()
-    if shift_end < user["shift_start_time"]:
-        send_with_keyboard(message, "Кінець зміни не може бути раніше її початку.")
-        return
-    if shift_end > now_dt() + timedelta(minutes=1):
-        send_with_keyboard(message, "Кінець зміни не може бути в майбутньому.")
-        return
-
+def calculate_shift_duration(user, shift_end):
     if user["break_active"] and user["break_start_time"] is not None:
         if shift_end < user["break_start_time"]:
-            send_with_keyboard(message, "Кінець зміни не може бути раніше початку перерви.")
-            return
+            raise ValueError("Кінець зміни не може бути раніше початку перерви.")
         user["total_break"] += shift_end - user["break_start_time"]
         user["break_active"] = False
         user["break_start_time"] = None
@@ -2075,6 +2079,45 @@ def end_shift(message, target_worker=None, operation_time=None):
     work_time = total_time - user["total_break"]
     if work_time <= timedelta():
         work_time = timedelta(minutes=1)
+    return total_time, work_time
+
+
+def clear_active_shift(user):
+    user["shift_started"] = False
+    user["shift_start_time"] = None
+    user["break_active"] = False
+    user["break_start_time"] = None
+    user["total_break"] = timedelta()
+    user["shift_capture"] = None
+    user["shift_worker"] = None
+    user["shift_chat_id"] = None
+    user["shift_thread_id"] = None
+    user["auto_close_in_progress"] = False
+
+
+def end_shift(message, target_worker=None, operation_time=None):
+    worker, user = get_shift_subject(message, target_worker)
+
+    if not user["shift_started"] or user["shift_start_time"] is None:
+        send_with_keyboard(message, "Немає активної зміни для завершення.")
+        return
+    if user.get("auto_close_in_progress"):
+        send_with_keyboard(message, "Зміна вже закривається автоматично. Зачекайте кілька секунд.")
+        return
+
+    shift_end = operation_time or now_dt()
+    if shift_end < user["shift_start_time"]:
+        send_with_keyboard(message, "Кінець зміни не може бути раніше її початку.")
+        return
+    if shift_end > now_dt() + timedelta(minutes=1):
+        send_with_keyboard(message, "Кінець зміни не може бути в майбутньому.")
+        return
+
+    try:
+        total_time, work_time = calculate_shift_duration(user, shift_end)
+    except ValueError as error:
+        send_with_keyboard(message, str(error))
+        return
     save_shift_to_sheet(
         message,
         user,
@@ -2093,14 +2136,10 @@ def end_shift(message, target_worker=None, operation_time=None):
         f"Чистий робочий час: {format_duration(work_time)}"
     )
 
-    user["shift_started"] = False
-    user["shift_start_time"] = None
-    user["break_active"] = False
-    user["break_start_time"] = None
-    user["total_break"] = timedelta()
-    user["shift_capture"] = None
+    clear_active_shift(user)
 
     send_with_keyboard(message, summary)
+
     def show_status(message):
         user = get_user(message.from_user.id, get_user_name(message))
 
@@ -2133,6 +2172,90 @@ def end_shift(message, target_worker=None, operation_time=None):
             )
 
         send_with_keyboard(message, status_text)
+
+
+def auto_close_overdue_shift(user_id, user):
+    shift_start = user.get("shift_start_time")
+    scheduled_end = shift_start.replace(
+        hour=AUTO_SHIFT_END_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    shift_end = max(scheduled_end, shift_start)
+    worker = user.get("shift_worker") or {
+        "telegram_user_id": str(user_id),
+        "name": user.get("full_name", str(user_id)),
+        "role": "",
+        "brigade": "",
+    }
+    chat_id = user.get("shift_chat_id")
+    thread_id = user.get("shift_thread_id")
+
+    user["auto_close_in_progress"] = True
+    if (
+        user.get("break_active")
+        and user.get("break_start_time") is not None
+        and user["break_start_time"] > shift_end
+    ):
+        user["break_active"] = False
+        user["break_start_time"] = None
+
+    try:
+        total_time, work_time = calculate_shift_duration(user, shift_end)
+        save_shift_to_sheet(
+            None,
+            user,
+            shift_end,
+            total_time,
+            work_time,
+            worker,
+            chat_id,
+        )
+    except Exception:
+        user["auto_close_in_progress"] = False
+        raise
+
+    summary = (
+        f"{user['full_name']}\n"
+        "Зміну автоматично закрито, оскільки її не закрили до півночі.\n\n"
+        f"Початок: {format_datetime(shift_start)}\n"
+        f"Кінець: {format_datetime(shift_end)}\n"
+        f"Перерви: {format_duration(user['total_break'])}\n"
+        f"Чистий робочий час: {format_duration(work_time)}"
+    )
+    clear_active_shift(user)
+
+    if chat_id is not None:
+        options = {"reply_markup": main_keyboard()}
+        if thread_id is not None:
+            options["message_thread_id"] = thread_id
+        try:
+            bot.send_message(chat_id, summary, **options)
+        except Exception as error:
+            print(f"Automatic shift closure notification failed for {user_id}: {error}")
+
+
+def automatic_shift_closure_scheduler():
+    """Close shifts from previous calendar days at 18:00 Kyiv time."""
+    while True:
+        current = now_dt()
+        for user_id, user in list(users.items()):
+            shift_start = user.get("shift_start_time")
+            if (
+                not user.get("shift_started")
+                or shift_start is None
+                or shift_start.date() >= current.date()
+                or user.get("auto_close_in_progress")
+            ):
+                continue
+            try:
+                auto_close_overdue_shift(user_id, user)
+            except Exception as error:
+                print(f"Automatic shift closure failed for {user_id}: {error}")
+        time.sleep(30)
+
+
 @bot.message_handler(commands=["start"])
 def start_command(message):
     if is_materials_topic(message):
@@ -2351,4 +2474,5 @@ def handle_materials_text(message, text):
 
 print("Bot is running...")
 threading.Thread(target=weather_scheduler, daemon=True).start()
+threading.Thread(target=automatic_shift_closure_scheduler, daemon=True).start()
 bot.infinity_polling(skip_pending=True)
