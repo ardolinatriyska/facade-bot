@@ -300,13 +300,16 @@ STOP_BREAK_TEXT = "Стоп перерви"
 SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
-MATERIALS_TEXT = "Взяти матеріал"
+MATERIALS_TEXT = "Взяв"
+MATERIAL_RETURN_TEXT = "Повернув"
 INVENTORY_TEXT = "Інвентаризація"
 BALANCE_TEXT = "Перевірити залишок"
+DEFECT_TEXT = "Дефектний акт"
 MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
 INVENTORY_CONFIRM_TEXT = "Підтвердити інвентаризацію"
 INVOICE_CONFIRM_TEXT = "Підтвердити накладну"
+DEFECT_CONFIRM_TEXT = "Підтвердити дефектний акт"
 MATERIAL_OTHER_MASTER_TEXT = "Взяв інший майстер"
 MARK_FOR_MASTER_TEXT = "Позначити за майстра"
 DELEGATE_CANCEL_TEXT = "Скасувати позначення"
@@ -322,9 +325,17 @@ MATERIAL_BALANCE_HEADERS = [
     "видано", "поточний залишок",
 ]
 
+DEFECT_HEADERS = [
+    "дата", "номер акта", "матеріал", "кількість", "од. виміру",
+    "захватка", "працівник", "роль", "опис", "telegram_file_id",
+    "telegram_user_id", "telegram_chat_id", "telegram_message_id", "timestamp",
+]
+
 DAILY_MATERIAL_SHEET = "Рух матеріалів"
 DAILY_MOVEMENT_COLUMNS = {
     "Видача": "Видано",
+    "Повернення": "Прийнято",
+    "Дефект": "Видано",
     "Надходження": "Прийнято",
     "Замовлення": "Замовлення",
 }
@@ -492,7 +503,8 @@ def main_keyboard():
 
 def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(INVENTORY_TEXT))
+    markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(MATERIAL_RETURN_TEXT))
+    markup.row(KeyboardButton(INVENTORY_TEXT), KeyboardButton(DEFECT_TEXT))
     markup.row(KeyboardButton(BALANCE_TEXT))
     markup.row(KeyboardButton(MATERIAL_OTHER_MASTER_TEXT))
     return markup
@@ -727,6 +739,51 @@ def parse_sheet_number(value):
         return 0.0
 
 
+def is_cubic_unit(value):
+    normalized = normalize_material_text(str(value or "").replace("³", "3"))
+    compact = re.sub(r"[\s._-]+", "", normalized)
+    return any(marker in compact for marker in ("м3", "мкуб", "куб"))
+
+
+def insulation_thickness_mm(material):
+    source = " ".join([
+        str(material.get("Матеріал", "")),
+        str(material.get("Синоніми", "")),
+    ]).lower().replace(",", ".")
+    matches = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(мм|см)(?!\w)", source)
+    for raw_value, unit in matches:
+        value = float(raw_value)
+        thickness = value * 10 if unit == "см" else value
+        if 5 <= thickness <= 500:
+            return thickness
+    return None
+
+
+def convert_invoice_quantity(material, quantity, source_unit):
+    material_name = str(material.get("Матеріал", ""))
+    is_insulation = normalize_material_text(material.get("Група", "")) == "утеплювачі"
+    if not is_insulation or not (is_cubic_unit(source_unit) or is_cubic_unit(material_name)):
+        return {
+            "quantity": quantity,
+            "unit": material.get("Од. виміру / примітка", "") or source_unit,
+            "source_quantity": quantity,
+            "source_unit": source_unit,
+            "thickness_mm": None,
+        }
+
+    thickness_mm = insulation_thickness_mm(material)
+    if not thickness_mm:
+        return None
+
+    return {
+        "quantity": round(quantity * 1000 / thickness_mm, 3),
+        "unit": "м.кв.",
+        "source_quantity": quantity,
+        "source_unit": source_unit or "м.куб.",
+        "thickness_mm": thickness_mm,
+    }
+
+
 def append_unique_text(existing, value):
     entries = [part.strip() for part in str(existing or "").split(",") if part.strip()]
     if value and value not in entries:
@@ -849,7 +906,17 @@ def get_daily_movement_row(worksheet, timestamp):
     return last_used + 1
 
 
-def sync_daily_material_movement(spreadsheet, message, material, operation, quantity, worker, timestamp):
+def sync_daily_material_movement(
+    spreadsheet,
+    message,
+    material,
+    operation,
+    quantity,
+    worker,
+    timestamp,
+    source_name="",
+    movement_label="",
+):
     worksheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
     pending_updates = []
     row_number = get_daily_movement_row(worksheet, timestamp)
@@ -870,15 +937,26 @@ def sync_daily_material_movement(spreadsheet, message, material, operation, quan
         issued_by = "RAHUY"
         if actor_id != target_id:
             issued_by = actor_worker.get("name") or get_user_name(message)
-        details[0] = append_unique_text(details[0], issued_by)
+        details[0] = append_unique_text(details[0], movement_label or "Видача через RAHUY Bot")
+        details[1] = append_unique_text(details[1], issued_by)
+        details[2] = append_unique_text(details[2], worker_name)
+    elif operation == "Повернення":
+        details[0] = append_unique_text(details[0], "Повернення через RAHUY Bot")
+        details[1] = append_unique_text(details[1], worker_name)
+        details[2] = append_unique_text(details[2], "RAHUY / склад")
+    elif operation == "Дефект":
+        details[0] = append_unique_text(details[0], "Дефектний акт через RAHUY Bot")
+        details[1] = append_unique_text(details[1], worker_name)
+        details[2] = append_unique_text(details[2], "RAHUY / склад (дефект)")
     else:
-        side_label = {
-            "Надходження": "Приймання через RAHUY Bot",
-            "Замовлення": "Замовлення через RAHUY Bot",
-        }[operation]
+        side_label = movement_label or (
+            "Надходження за накладною" if operation == "Надходження" else "Замовлення через RAHUY Bot"
+        )
         details[0] = append_unique_text(details[0], side_label)
-    details[1] = append_unique_text(details[1], "RAHUY Bot / склад")
-    details[2] = append_unique_text(details[2], worker_name)
+        details[1] = append_unique_text(
+            details[1], source_name or ("Постачальник" if operation == "Надходження" else worker_name),
+        )
+        details[2] = append_unique_text(details[2], worker_name)
     column = get_daily_material_column(worksheet, material, operation)
     cell = f"{column_letter(column)}{row_number}"
     current_value = worksheet.acell(cell).value
@@ -944,17 +1022,16 @@ def interpret_material_with_ai(text, catalog):
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "operation": {"type": "string", "enum": ["Видача", "Надходження", "Замовлення", "Невідомо"]},
             "quantity": {"type": ["number", "null"]},
             "material": {"type": ["string", "null"]},
             "confidence": {"type": "number"},
         },
-        "required": ["operation", "quantity", "material", "confidence"],
+        "required": ["quantity", "material", "confidence"],
     }
     instructions = (
-        "Ти розпізнаєш короткі українські повідомлення працівників про рух матеріалів. "
+        "Ти розпізнаєш короткі українські повідомлення працівників про матеріали та кількість. "
         "Обери material тільки як точну назву з каталогу. Використовуй синоніми лише для зіставлення. "
-        "Не вигадуй матеріал, кількість чи дію. Якщо даних недостатньо, поверни null або Невідомо. "
+        "Не визначай тип операції. Не вигадуй матеріал або кількість. Якщо даних недостатньо, поверни null. "
         "Це лише пропозиція для подальшого підтвердження працівником."
     )
     payload = {
@@ -993,10 +1070,7 @@ def interpret_material_with_ai(text, catalog):
     if quantity is None or quantity <= 0:
         return None
 
-    operation = parsed.get("operation")
-    if operation not in ("Видача", "Надходження", "Замовлення"):
-        operation = detect_material_operation(text)
-    return {"quantity": quantity, "operation": operation, "selected": selected}
+    return {"quantity": quantity, "selected": selected}
 
 
 def interpret_invoice_photo_with_ai(image_bytes, catalog):
@@ -1040,6 +1114,7 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
     }
     instructions = (
         "Розпізнай українську накладну з фото. Витягни постачальника, номер, дату та всі позиції. "
+        "Для кожної позиції поверни одиницю саме з накладної, зокрема м³ для утеплювача в кубах. "
         "Для material використовуй лише точну назву з каталогу; зіставляй за назвою, одиницею й синонімами. "
         "Якщо відповідника немає або кількість нечитабельна, поверни material або quantity як null. "
         "Не вигадуй дані. Результат є лише чернеткою, яку людина підтвердить окремо."
@@ -1085,7 +1160,14 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
         except (TypeError, ValueError):
             quantity = None
         if material and quantity and quantity > 0 and float(item.get("confidence", 0) or 0) >= 0.65:
-            items.append({"material": material, "quantity": quantity})
+            source_unit = str(item.get("unit") or "").strip()
+            converted = convert_invoice_quantity(material, quantity, source_unit)
+            if converted:
+                items.append({"material": material, **converted})
+            else:
+                unmatched.append(
+                    f"{item.get('raw_name') or material['Матеріал']} (не визначено товщину утеплювача)"
+                )
         else:
             unmatched.append(str(item.get("raw_name") or "невідома позиція"))
 
@@ -1096,18 +1178,6 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
         "items": items,
         "unmatched": unmatched,
     }
-
-
-def detect_material_operation(text):
-    normalized = normalize_material_text(text)
-    if any(word in normalized for word in ("замовляю", "замовити", "замовив", "замовила", "замовлення")):
-        return "Замовлення"
-    if any(word in normalized for word in (
-        "привіз", "привезли", "надійшло", "отримали на склад",
-        "повернув", "повернула", "повернули", "повернення",
-    )):
-        return "Надходження"
-    return "Видача"
 
 
 def send_material_choice(message, text, forced_operation=None):
@@ -1147,9 +1217,7 @@ def send_material_choice(message, text, forced_operation=None):
 
     user["pending_material"] = {
         "kind": "material",
-        "operation": forced_operation or (
-            ai_result["operation"] if ai_result else detect_material_operation(text)
-        ),
+        "operation": forced_operation or "Видача",
         "quantity": quantity,
         "candidates": candidates,
         "selected": None,
@@ -1313,6 +1381,8 @@ def save_inventory_record(message):
             abs(adjustment),
             worker,
             timestamp,
+            source_name="RAHUY / інвентаризація",
+            movement_label="Коригування інвентаризації",
         )
 
     log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
@@ -1393,6 +1463,167 @@ def set_inventory_quantity(message, text, pending):
     return select_material_candidate(message, pending["selected"].get("Матеріал", ""))
 
 
+def send_defect_material_prompt(message, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Введіть дефектний матеріал і кількість.\n"
+        "Наприклад: 4 кутики або клей-піна 1 балон.",
+        markup,
+    )
+
+
+def send_defect_photo_prompt(message, pending, error_text=""):
+    material = pending["selected"]
+    unit = material.get("Од. виміру / примітка", "") or "од."
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Дефектний матеріал: {material['Матеріал']}\n"
+        f"Кількість: {pending['quantity']:g} {unit}\n\n"
+        "Надішліть фото дефекту. Опис причини можна додати в підписі до фото.",
+        markup,
+    )
+
+
+def start_defect_report(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {"kind": "defect_input", "candidates": []}
+    send_defect_material_prompt(message)
+
+
+def select_defect_candidate(message, material_name, pending):
+    selected = next(
+        (row for row in pending.get("candidates", []) if row.get("Матеріал") == material_name),
+        None,
+    )
+    if not selected:
+        return False
+    pending["selected"] = selected
+    pending["kind"] = "defect_photo"
+    send_defect_photo_prompt(message, pending)
+    return True
+
+
+def choose_defect_material(message, text, pending):
+    if pending.get("kind") == "defect_choice":
+        if select_defect_candidate(message, text, pending):
+            return True
+
+    quantity = extract_material_quantity(text)
+    catalog = get_material_catalog()
+    candidates = find_material_candidates(text) if quantity and quantity > 0 else []
+    if not candidates or len(candidates) > 1 or quantity is None:
+        ai_result = interpret_material_with_ai(text, catalog)
+        if ai_result:
+            quantity = ai_result["quantity"]
+            candidates = [ai_result["selected"]]
+
+    if quantity is None or quantity <= 0:
+        send_defect_material_prompt(message, "Не бачу кількості.")
+        return True
+    if not candidates:
+        send_defect_material_prompt(message, "Не знайшов матеріал у довіднику.")
+        return True
+
+    pending.update({"quantity": quantity, "candidates": candidates})
+    if len(candidates) == 1:
+        return select_defect_candidate(message, candidates[0].get("Матеріал", ""), pending)
+
+    pending["kind"] = "defect_choice"
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for candidate in candidates:
+        markup.row(KeyboardButton(str(candidate.get("Матеріал", ""))))
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    send_with_markup(message, "Уточніть дефектний матеріал.", markup)
+    return True
+
+
+def handle_defect_photo(message, pending):
+    pending["photo_file_id"] = message.photo[-1].file_id
+    pending["photo_message_id"] = message.message_id
+    pending["description"] = str(message.caption or "").strip()
+    pending["kind"] = "defect_confirm"
+    material = pending["selected"]
+    unit = material.get("Од. виміру / примітка", "") or "од."
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DEFECT_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
+    description = pending["description"] or "не вказано"
+    send_with_markup(
+        message,
+        f"Дефектний акт:\n"
+        f"Матеріал: {material['Матеріал']}\n"
+        f"Кількість: {pending['quantity']:g} {unit}\n"
+        f"Опис: {description}\n"
+        "Фото додано. Підтвердити списання дефектного матеріалу?",
+        markup,
+    )
+
+
+def save_defect_report(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_material")
+    if not pending or pending.get("kind") != "defect_confirm":
+        send_with_keyboard(message, "Немає дефектного акта для підтвердження.")
+        return
+
+    material = pending["selected"]
+    quantity = pending["quantity"]
+    worker = get_worker(message.from_user.id) or {}
+    capture = user.get("selected_capture") or {}
+    timestamp = now_dt()
+    act_number = f"DEF-{timestamp:%Y%m%d-%H%M%S}-{message.from_user.id}"
+    spreadsheet = get_sheet()
+    sync_daily_material_movement(
+        spreadsheet, message, material, "Дефект", quantity, worker, timestamp,
+    )
+
+    unit = material.get("Од. виміру / примітка", "")
+    description = pending.get("description", "")
+    defect_sheet = get_or_create_worksheet(spreadsheet, "Дефектні акти", DEFECT_HEADERS)
+    defect_sheet.append_row([
+        timestamp.strftime("%d.%m.%Y"),
+        act_number,
+        material["Матеріал"],
+        quantity,
+        unit,
+        capture.get("name", ""),
+        worker.get("name") or user["full_name"],
+        worker.get("role", ""),
+        description,
+        pending.get("photo_file_id", ""),
+        str(message.from_user.id),
+        str(message.chat.id),
+        str(pending.get("photo_message_id", "")),
+        format_datetime(timestamp),
+    ])
+    log_sheet = get_or_create_worksheet(spreadsheet, "Операції матеріалів", MATERIAL_LOG_HEADERS)
+    log_sheet.append_row([
+        timestamp.strftime("%d.%m.%Y"),
+        "Дефектний акт",
+        material["Матеріал"],
+        quantity,
+        unit,
+        capture.get("name", ""),
+        worker.get("name") or user["full_name"],
+        worker.get("role", ""),
+        "; ".join(part for part in (act_number, description) if part),
+        str(message.from_user.id),
+        str(message.chat.id),
+        format_datetime(timestamp),
+    ])
+    user["pending_material"] = None
+    send_with_keyboard(
+        message,
+        f"Дефектний акт {act_number} записано.\n"
+        f"З придатного залишку списано: {quantity:g} {unit or 'од.'} — {material['Матеріал']}.",
+    )
+
+
 def start_balance_check(message):
     user = get_user(message.from_user.id, get_user_name(message))
     user["pending_material"] = {
@@ -1449,8 +1680,15 @@ def send_invoice_preview(message, invoice):
     lines.append("")
     for item in invoice["items"]:
         material = item["material"]
-        unit = material.get("Од. виміру / примітка", "") or "од."
-        lines.append(f"• {material['Матеріал']} — {item['quantity']:g} {unit}")
+        unit = item.get("unit") or material.get("Од. виміру / примітка", "") or "од."
+        if item.get("thickness_mm"):
+            lines.append(
+                f"• {material['Матеріал']}: {item['source_quantity']:g} "
+                f"{item['source_unit']} → {item['quantity']:g} {unit} "
+                f"(товщина {item['thickness_mm']:g} мм)"
+            )
+        else:
+            lines.append(f"• {material['Матеріал']} — {item['quantity']:g} {unit}")
     if invoice.get("unmatched"):
         lines.append("\nНе додано без уточнення: " + ", ".join(invoice["unmatched"]))
     lines.append("\nПідтвердити надходження?")
@@ -1525,18 +1763,32 @@ def save_invoice_delivery(message):
         material = item["material"]
         quantity = item["quantity"]
         sync_daily_material_movement(
-            spreadsheet, message, material, "Надходження", quantity, worker, timestamp,
+            spreadsheet,
+            message,
+            material,
+            "Надходження",
+            quantity,
+            worker,
+            timestamp,
+            source_name=invoice.get("supplier") or "Постачальник",
         )
+        item_note = note
+        if item.get("thickness_mm"):
+            conversion_note = (
+                f"Перерахунок: {item['source_quantity']:g} {item['source_unit']} → "
+                f"{quantity:g} м.кв.; товщина {item['thickness_mm']:g} мм"
+            )
+            item_note = "; ".join(part for part in (note, conversion_note) if part)
         log_sheet.append_row([
             timestamp.strftime("%d.%m.%Y"),
             "Надходження за накладною",
             material["Матеріал"],
             quantity,
-            material.get("Од. виміру / примітка", ""),
+            item.get("unit") or material.get("Од. виміру / примітка", ""),
             capture.get("name", ""),
             worker.get("name") or user["full_name"],
             worker.get("role", ""),
-            note,
+            item_note,
             str(message.from_user.id),
             str(message.chat.id),
             format_datetime(timestamp),
@@ -1886,7 +2138,8 @@ def start_command(message):
     if is_materials_topic(message):
         send_with_keyboard(
             message,
-            "Ви у гілці «Матеріали». Напишіть, що взяли або отримали, наприклад: «взяв 5 кутиків».",
+            "Ви у гілці «Матеріали». Напишіть матеріал і кількість, наприклад: «5 кутиків». "
+            "Будь-який такий запис означає видачу матеріалу.",
         )
         return
 
@@ -1947,6 +2200,18 @@ def status_command(message):
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
+    if is_materials_topic(message):
+        user = get_user(message.from_user.id, get_user_name(message))
+        pending = user.get("pending_material") or {}
+        if pending.get("kind") == "defect_photo":
+            handle_defect_photo(message, pending)
+            return
+        if pending.get("kind") in {"defect_input", "defect_choice"}:
+            send_defect_material_prompt(message, "Спочатку введіть матеріал і кількість.")
+            return
+        if pending.get("kind") == "defect_confirm":
+            send_with_keyboard(message, "Фото вже додано. Підтвердьте дефектний акт кнопкою або скасуйте його.")
+            return
     handle_invoice_photo(message)
 
 
@@ -2011,10 +2276,26 @@ def handle_materials_text(message, text):
         start_inventory(message, text)
         return
 
-    if text == MATERIALS_TEXT:
+    if text == DEFECT_TEXT:
+        start_defect_report(message)
+        return
+
+    if text in {MATERIALS_TEXT, "Взяти матеріал"}:
+        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
         send_with_keyboard(
             message,
-            "Напишіть, що взяли або отримали. Наприклад: «взяв 5 кутиків» або «клей-піна 1 балон».",
+            "Напишіть матеріал і кількість. Наприклад: «5 кутиків» або «клей-піна 1 балон». "
+            "Запис буде оформлено як видачу.",
+        )
+        return
+
+    if text == MATERIAL_RETURN_TEXT:
+        user = get_user(message.from_user.id, get_user_name(message))
+        user["pending_material"] = {"kind": "return_input"}
+        send_with_keyboard(
+            message,
+            "Напишіть матеріал і кількість, які повертаєте на склад. "
+            "Наприклад: «3 кутики» або «клей-піна 1 балон».",
         )
         return
 
@@ -2034,8 +2315,25 @@ def handle_materials_text(message, text):
         save_invoice_delivery(message)
         return
 
+
+    if text == DEFECT_CONFIRM_TEXT:
+        save_defect_report(message)
+        return
+
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
+    if pending and pending.get("kind") in {"defect_input", "defect_choice"}:
+        choose_defect_material(message, text, pending)
+        return
+    if pending and pending.get("kind") == "defect_photo":
+        send_defect_photo_prompt(message, pending, "Очікую фото дефекту, а не текст.")
+        return
+    if pending and pending.get("kind") == "defect_confirm":
+        send_with_keyboard(message, "Підтвердьте дефектний акт кнопкою або скасуйте його.")
+        return
+    if pending and pending.get("kind") == "return_input":
+        send_material_choice(message, text, forced_operation="Повернення")
+        return
     if pending and pending.get("kind") == "inventory_material":
         choose_inventory_material(message, text, pending)
         return
@@ -2048,20 +2346,7 @@ def handle_materials_text(message, text):
     if pending and select_material_candidate(message, text):
         return
 
-    material_keywords = (
-        "взяв", "взяла", "взяли", "видати", "видай", "видав",
-        "привіз", "привезли", "надійшло", "отримали",
-        "повернув", "повернула", "повернули",
-        "замовляю", "замовити", "замовив", "замовила",
-    )
-    if any(keyword in normalize_material_text(text) for keyword in material_keywords):
-        send_material_choice(message, text)
-        return
-
-    send_with_keyboard(
-        message,
-        "Напишіть рух матеріалу, наприклад: «взяв 5 кутиків» або «привезли 10 балонів клей-піни».",
-    )
+    send_material_choice(message, text, forced_operation="Видача")
 
 
 print("Bot is running...")
