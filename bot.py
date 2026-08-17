@@ -34,6 +34,8 @@ MATERIALS_THREAD_ID = os.getenv("MATERIALS_THREAD_ID")
 # "Події" у WellPlaceBOT. Ця тема має ідентифікатор 1 у посиланні Telegram.
 WEATHER_CHAT_ID = -1004258418040
 WEATHER_THREAD_ID = 1
+EVENTS_CHAT_ID = os.getenv("EVENTS_CHAT_ID", str(WEATHER_CHAT_ID))
+EVENTS_THREAD_ID = os.getenv("EVENTS_THREAD_ID", str(WEATHER_THREAD_ID))
 WEATHER_LATITUDE = 49.8157
 WEATHER_LONGITUDE = 24.1346
 
@@ -147,6 +149,9 @@ def thread_id_command(message):
         message_thread_id=thread_id
     )
 def get_sheet():
+    if not SHEET_ID:
+        raise ValueError("SHEET_ID не задано")
+
     if GOOGLE_CREDENTIALS_FILE:
         credentials = Credentials.from_service_account_file(
             GOOGLE_CREDENTIALS_FILE,
@@ -181,6 +186,218 @@ def get_or_create_worksheet(spreadsheet, title, headers):
     worksheet.update("A1", [headers])
 
     return worksheet
+
+
+def normalize_sheet_header(value):
+    value = str(value or "").strip().lower()
+    return " ".join(
+        value.replace("’", "'").replace("ʼ", "'").replace("`", "'").replace("_", " ").split()
+    )
+
+
+def get_record_value(record, aliases):
+    normalized_aliases = {normalize_sheet_header(alias) for alias in aliases}
+    for key, value in record.items():
+        if normalize_sheet_header(key) in normalized_aliases:
+            return value
+    return ""
+
+
+def get_capture_objects(spreadsheet):
+    """Read unique object names from the existing capture directory without changing it."""
+    try:
+        captures_sheet = spreadsheet.worksheet("Захватки")
+    except gspread.WorksheetNotFound:
+        return []
+
+    objects = []
+    seen = set()
+    for row in captures_sheet.get_all_records():
+        name = str(
+            get_record_value(row, {"об'єкт", "проєкт", "проект", "object", "project"}) or ""
+        ).strip()
+        key = name.casefold()
+        if name and key not in seen:
+            objects.append(name)
+            seen.add(key)
+    return objects
+
+
+def get_or_create_objects_worksheet(spreadsheet):
+    """Create only the explicitly approved object directory when it is absent."""
+    try:
+        return spreadsheet.worksheet(OBJECTS_SHEET)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=OBJECTS_SHEET,
+            rows=1000,
+            cols=len(OBJECTS_HEADERS),
+        )
+        values = [OBJECTS_HEADERS]
+        values.extend([[name, "TRUE"] for name in get_capture_objects(spreadsheet)])
+        worksheet.update("A1", values)
+        return worksheet
+
+
+def get_active_objects():
+    spreadsheet = get_sheet()
+    worksheet = get_or_create_objects_worksheet(spreadsheet)
+    headers = worksheet.row_values(1)
+    if not any(
+        normalize_sheet_header(header) in {"об'єкт", "назва", "object", "name", "project", "проєкт"}
+        for header in headers
+    ):
+        raise ValueError("Вкладка «Об’єкти» повинна містити колонку «об’єкт» або «назва».")
+
+    objects = []
+    seen = set()
+    for row in worksheet.get_all_records():
+        active = str(get_record_value(row, {"active", "активний", "активна"}) or "TRUE").strip().upper()
+        if active in {"FALSE", "0", "НІ", "NO", "CLOSED", "INACTIVE"}:
+            continue
+        name = str(
+            get_record_value(row, {"об'єкт", "назва", "object", "name", "project", "проєкт"}) or ""
+        ).strip()
+        key = name.casefold()
+        if name and key not in seen:
+            objects.append({"name": name})
+            seen.add(key)
+    return objects
+
+
+def event_field_for_header(header):
+    normalized = normalize_sheet_header(header)
+    for field, aliases in EVENT_FIELD_ALIASES.items():
+        if normalized in {normalize_sheet_header(alias) for alias in aliases}:
+            return field
+    return None
+
+
+def event_fields_from_headers(headers):
+    fields = [event_field_for_header(header) for header in headers]
+    if "date" not in fields and "event_type" in fields:
+        event_type_index = fields.index("event_type")
+        if event_type_index > 0 and fields[event_type_index - 1] is None:
+            fields[event_type_index - 1] = "date"
+    if "status" not in fields and len(fields) > 4 and fields[4] is None:
+        fields[4] = "status"
+    return fields
+
+
+def get_question_worksheet(spreadsheet):
+    worksheets = spreadsheet.worksheets()
+    by_title = {worksheet.title.strip(): worksheet for worksheet in worksheets}
+    for title in (EVENTS_SHEET, QUESTIONS_SHEET):
+        if title in by_title:
+            return by_title[title]
+    raise ValueError("У налаштованій таблиці немає вкладки «Події» або «Питання».")
+
+
+def append_event_to_sheet(message, event_type, object_name, content, target_worker=None):
+    """Append a question or task while keeping target and initiator separate."""
+    spreadsheet = get_sheet()
+    worksheet = get_question_worksheet(spreadsheet)
+
+    headers = worksheet.row_values(1)
+    fields = event_fields_from_headers(headers)
+    missing_fields = {
+        required
+        for required in ("event_type", "object", "question", "status", "target", "initiator")
+        if required not in fields
+    }
+    if missing_fields:
+        raise ValueError(
+            "Цільова вкладка повинна мати колонки для типу, об’єкта, тексту, "
+            "адресата/виконавця та ініціатора/реєстратора."
+        )
+
+    timestamp = now_dt()
+    initiator_name = get_user_name(message)
+    target_name = (target_worker or {}).get("name") or initiator_name
+    values = {
+        "date": timestamp.strftime("%d.%m.%Y"),
+        "time": timestamp.strftime("%H:%M:%S"),
+        "event_type": event_type,
+        "object": object_name,
+        "question": content,
+        "target": target_name,
+        "initiator": initiator_name,
+        "author": initiator_name,
+        "telegram_user_id": str(message.from_user.id),
+        "telegram_chat_id": str(message.chat.id),
+        "telegram_message_id": str(message.message_id),
+        "telegram_thread_id": str(getattr(message, "message_thread_id", "") or ""),
+        "status": ACTIVE_EVENT_STATUS,
+        "timestamp": format_datetime(timestamp),
+    }
+    worksheet.append_row(
+        [values.get(field, "") for field in fields],
+        value_input_option="RAW",
+    )
+    return worksheet.title.strip()
+
+
+def get_event_records(event_type, active_only=False):
+    spreadsheet = get_sheet()
+    worksheet = get_question_worksheet(spreadsheet)
+    rows = worksheet.get_all_values()
+    if not rows:
+        return []
+
+    fields = event_fields_from_headers(rows[0])
+    records = []
+    for row_number, row in enumerate(rows[1:], start=2):
+        padded = list(row) + [""] * max(0, len(fields) - len(row))
+        record = {
+            field: padded[index]
+            for index, field in enumerate(fields)
+            if field is not None
+        }
+        if str(record.get("event_type", "")).strip() != event_type:
+            continue
+        status = str(record.get("status", "")).strip() or ACTIVE_EVENT_STATUS
+        if active_only and status.casefold() not in {
+            ACTIVE_EVENT_STATUS.casefold(),
+            "active",
+            "нове",
+        }:
+            continue
+        record["status"] = status
+        record["row_number"] = row_number
+        records.append(record)
+    return records
+
+
+def set_event_final_status(row_number, event_type):
+    records = get_event_records(event_type)
+    record = next((item for item in records if item["row_number"] == row_number), None)
+    if not record:
+        raise ValueError("Запис не знайдено або його тип змінився.")
+    if record["status"].casefold() not in {
+        ACTIVE_EVENT_STATUS.casefold(),
+        "active",
+        "нове",
+    }:
+        raise ValueError("Цей запис уже не активний.")
+
+    new_status = (
+        RESOLVED_QUESTION_STATUS
+        if event_type == QUESTION_TEXT
+        else COMPLETED_TASK_STATUS
+    )
+    worksheet = get_question_worksheet(get_sheet())
+    worksheet.update_cell(row_number, 5, new_status)
+    return new_status
+
+
+def append_question_to_events(message, object_name, question, target_worker=None):
+    return append_event_to_sheet(
+        message,
+        QUESTION_TEXT,
+        object_name,
+        question,
+        target_worker,
+    )
 
 
 def get_lookup_row(spreadsheet, sheet_name, key_column, key_value):
@@ -325,6 +542,53 @@ DEFECT_CONFIRM_TEXT = "Підтвердити дефектний акт"
 MATERIAL_OTHER_MASTER_TEXT = "Взяв інший майстер"
 MARK_FOR_MASTER_TEXT = "Позначити за майстра"
 DELEGATE_CANCEL_TEXT = "Скасувати позначення"
+QUESTION_TEXT = "Питання"
+TASK_TEXT = "Завдання"
+EVENT_CANCEL_TEXT = "Скасувати"
+EVENT_SELF_TEXT = "Не обирати — собі"
+ACTIVE_QUESTIONS_TEXT = "Актуальні питання"
+ACTIVE_TASKS_TEXT = "Актуальні завдання"
+EVENT_LIST_BACK_TEXT = "Назад до подій"
+RESOLVE_QUESTION_TEXT = "Позначити вирішеним"
+COMPLETE_TASK_TEXT = "Позначити виконаним"
+
+ACTIVE_EVENT_STATUS = "Активне"
+RESOLVED_QUESTION_STATUS = "Вирішено"
+COMPLETED_TASK_STATUS = "Виконано"
+
+OBJECTS_SHEET = "Об’єкти"
+EVENTS_SHEET = "Події"
+QUESTIONS_SHEET = "Питання"
+OBJECTS_HEADERS = ["об’єкт", "active"]
+
+EVENT_FIELD_ALIASES = {
+    "date": {"дата", "date"},
+    "time": {"час", "time"},
+    "event_type": {"тип", "тип події", "тема", "подія", "категорія", "topic", "event", "event type"},
+    "object": {"об'єкт", "проєкт", "проект", "object", "project"},
+    "question": {
+        "питання", "текст питання", "опис", "опис події", "текст", "коментар", "question",
+    },
+    "target": {
+        "адресат / виконавець", "адресат/виконавець", "адресат", "виконавець",
+        "призначений", "recipient", "assignee",
+    },
+    "initiator": {
+        "ініціатор / реєстратор", "ініціатор/реєстратор", "ініціатор", "реєстратор",
+        "створив", "initiator", "created by",
+    },
+    "author": {"автор", "працівник", "користувач", "піб", "user", "user name"},
+    "telegram_user_id": {"telegram user id", "telegram_user_id", "user id", "user_id"},
+    "telegram_chat_id": {"telegram chat id", "telegram_chat_id", "chat id", "chat_id"},
+    "telegram_message_id": {
+        "telegram message id", "telegram_message_id", "message id", "message_id",
+    },
+    "telegram_thread_id": {
+        "telegram thread id", "telegram_thread_id", "thread id", "thread_id",
+    },
+    "status": {"статус", "status"},
+    "timestamp": {"timestamp", "created at", "created_at", "дата створення"},
+}
 
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
@@ -513,6 +777,13 @@ def main_keyboard():
     return markup
 
 
+def events_keyboard():
+    markup = main_keyboard()
+    markup.row(KeyboardButton(QUESTION_TEXT), KeyboardButton(TASK_TEXT))
+    markup.row(KeyboardButton(ACTIVE_QUESTIONS_TEXT), KeyboardButton(ACTIVE_TASKS_TEXT))
+    return markup
+
+
 def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(MATERIAL_RETURN_TEXT))
@@ -529,6 +800,16 @@ def is_materials_topic(message):
         bool(MATERIALS_CHAT_ID and MATERIALS_THREAD_ID)
         and str(message.chat.id) == str(MATERIALS_CHAT_ID)
         and str(thread_id) == str(MATERIALS_THREAD_ID)
+    )
+
+
+def is_events_topic(message):
+    """Event actions are shown only in the configured «Події» topic."""
+    thread_id = getattr(message, "message_thread_id", None)
+    return (
+        bool(EVENTS_CHAT_ID and EVENTS_THREAD_ID)
+        and str(message.chat.id) == str(EVENTS_CHAT_ID)
+        and str(thread_id) == str(EVENTS_THREAD_ID)
     )
 
 
@@ -561,6 +842,7 @@ def get_user(user_id, full_name):
             "pending_material": None,
             "pending_delegate": None,
             "material_for_worker": None,
+            "pending_event": None,
         },
     )
 
@@ -576,8 +858,349 @@ def send_with_markup(message, text, markup):
 
 
 def send_with_keyboard(message, text):
-    keyboard = materials_keyboard() if is_materials_topic(message) else main_keyboard()
+    if is_materials_topic(message):
+        keyboard = materials_keyboard()
+    elif is_events_topic(message):
+        keyboard = events_keyboard()
+    else:
+        keyboard = main_keyboard()
     send_with_markup(message, text, keyboard)
+
+
+def event_noun(event_type):
+    return "питання" if event_type == QUESTION_TEXT else "завдання"
+
+
+def event_target_label(event_type):
+    return "Адресат" if event_type == QUESTION_TEXT else "Виконавець"
+
+
+def send_event_object_selection(message, event_type, objects, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for item in objects:
+        markup.row(KeyboardButton(item["name"]))
+    markup.row(KeyboardButton(EVENT_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Оберіть об’єкт для {event_noun(event_type)}:",
+        markup,
+    )
+
+
+def send_event_worker_selection(message, pending, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(EVENT_SELF_TEXT))
+    for worker in pending["workers"]:
+        markup.row(KeyboardButton(worker_button_text(worker)))
+    markup.row(KeyboardButton(EVENT_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    target_word = "адресата питання" if pending["event_type"] == QUESTION_TEXT else "виконавця завдання"
+    send_with_markup(
+        message,
+        f"{prefix}Необов’язково оберіть {target_word}. "
+        f"Якщо нікого не обирати, запис буде призначено вам:",
+        markup,
+    )
+
+
+def send_event_content_prompt(message, pending):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(EVENT_CANCEL_TEXT))
+    target_worker = pending.get("target_worker")
+    target_name = (target_worker or {}).get("name") or get_user_name(message)
+    prompt = (
+        "Напишіть питання одним повідомленням:"
+        if pending["event_type"] == QUESTION_TEXT
+        else "Опишіть завдання одним повідомленням:"
+    )
+    send_with_markup(
+        message,
+        f"Об’єкт: {pending['object']}\n"
+        f"{event_target_label(pending['event_type'])}: {target_name}\n\n"
+        f"{prompt}",
+        markup,
+    )
+
+
+def start_event(message, event_type):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_event"] = None
+    try:
+        objects = get_active_objects()
+    except Exception as error:
+        print(f"Object directory loading failed: {error}")
+        send_with_keyboard(message, f"Не вдалося завантажити об’єкти. {error}")
+        return
+
+    if not objects:
+        send_with_keyboard(
+            message,
+            "У вкладці «Об’єкти» немає активних об’єктів. Додайте об’єкт і повторіть спробу.",
+        )
+        return
+
+    user["pending_event"] = {
+        "kind": "question" if event_type == QUESTION_TEXT else "task",
+        "event_type": event_type,
+        "stage": "object",
+        "objects": objects,
+    }
+    send_event_object_selection(message, event_type, objects)
+
+
+def start_question(message):
+    start_event(message, QUESTION_TEXT)
+
+
+def start_task(message):
+    start_event(message, TASK_TEXT)
+
+
+def event_record_button(record):
+    prefix = f"#{record['row_number']} {record.get('object') or 'Без об’єкта'}: "
+    content = str(record.get("question") or "Без тексту").strip()
+    return (prefix + content)[:60]
+
+
+def send_active_event_list(message, event_type, prefix=""):
+    user = get_user(message.from_user.id, get_user_name(message))
+    try:
+        records = get_event_records(event_type, active_only=True)
+    except Exception as error:
+        print(f"Active event list loading failed: {error}")
+        user["pending_event"] = None
+        send_with_keyboard(message, f"Не вдалося завантажити активні записи. {error}")
+        return
+
+    if not records:
+        user["pending_event"] = None
+        message_text = f"Активних {event_noun(event_type)} немає."
+        if prefix:
+            message_text = f"{prefix}\n\n{message_text}"
+        send_with_keyboard(message, message_text)
+        return
+
+    user["pending_event"] = {
+        "kind": "manage",
+        "event_type": event_type,
+        "stage": "list",
+        "records": records,
+    }
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for record in records[:30]:
+        markup.row(KeyboardButton(event_record_button(record)))
+    markup.row(KeyboardButton(EVENT_LIST_BACK_TEXT))
+    message_text = f"Оберіть активне {event_noun(event_type)}:"
+    if prefix:
+        message_text = f"{prefix}\n\n{message_text}"
+    send_with_markup(message, message_text, markup)
+
+
+def send_event_record_details(message, pending, error_text=""):
+    record = pending["record"]
+    action_text = (
+        RESOLVE_QUESTION_TEXT
+        if pending["event_type"] == QUESTION_TEXT
+        else COMPLETE_TASK_TEXT
+    )
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(action_text))
+    markup.row(KeyboardButton(EVENT_LIST_BACK_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}#{record['row_number']} — {pending['event_type']}\n"
+        f"Об’єкт: {record.get('object') or '-'}\n"
+        f"{event_target_label(pending['event_type'])}: {record.get('target') or '-'}\n"
+        f"Ініціатор: {record.get('initiator') or '-'}\n"
+        f"Статус: {record.get('status') or ACTIVE_EVENT_STATUS}\n\n"
+        f"{record.get('question') or '-'}",
+        markup,
+    )
+
+
+def handle_events_text(message, text):
+    user = get_user(message.from_user.id, get_user_name(message))
+
+    if text == ACTIVE_QUESTIONS_TEXT:
+        send_active_event_list(message, QUESTION_TEXT)
+        return True
+
+    if text == ACTIVE_TASKS_TEXT:
+        send_active_event_list(message, TASK_TEXT)
+        return True
+
+    if text == QUESTION_TEXT:
+        start_question(message)
+        return True
+
+    if text == TASK_TEXT:
+        start_task(message)
+        return True
+
+    if text == EVENT_LIST_BACK_TEXT:
+        user["pending_event"] = None
+        send_with_keyboard(message, "Меню подій.")
+        return True
+
+    if text == EVENT_CANCEL_TEXT:
+        if user.get("pending_event"):
+            user["pending_event"] = None
+            send_with_keyboard(message, "Створення запису скасовано.")
+            return True
+        return False
+
+    pending = user.get("pending_event")
+    if not pending:
+        return False
+
+    if pending.get("kind") == "manage" and pending.get("stage") == "list":
+        selected = next(
+            (
+                record
+                for record in pending["records"][:30]
+                if event_record_button(record) == text
+            ),
+            None,
+        )
+        if not selected:
+            send_active_event_list(
+                message,
+                pending["event_type"],
+                "Запис не знайдено. Оберіть його кнопкою.",
+            )
+            return True
+        pending["record"] = selected
+        pending["stage"] = "details"
+        send_event_record_details(message, pending)
+        return True
+
+    if pending.get("kind") == "manage" and pending.get("stage") == "details":
+        expected_action = (
+            RESOLVE_QUESTION_TEXT
+            if pending["event_type"] == QUESTION_TEXT
+            else COMPLETE_TASK_TEXT
+        )
+        if text != expected_action:
+            send_event_record_details(message, pending, "Оберіть дію кнопкою.")
+            return True
+        try:
+            new_status = set_event_final_status(
+                pending["record"]["row_number"],
+                pending["event_type"],
+            )
+        except Exception as error:
+            print(f"Event status update failed: {error}")
+            send_event_record_details(message, pending, f"Не вдалося змінити статус. {error}")
+            return True
+        event_type = pending["event_type"]
+        send_active_event_list(
+            message,
+            event_type,
+            f"Статус змінено на «{new_status}».",
+        )
+        return True
+
+    main_actions = {
+        START_SHIFT_TEXT,
+        START_BREAK_TEXT,
+        STOP_BREAK_TEXT,
+        END_SHIFT_TEXT,
+        STATUS_TEXT,
+        SELECT_CAPTURE_TEXT,
+        MARK_FOR_MASTER_TEXT,
+    }
+    if text in main_actions:
+        user["pending_event"] = None
+        return False
+
+    if pending.get("stage") == "object":
+        selected = next(
+            (
+                item
+                for item in pending["objects"]
+                if item["name"].casefold() == text.casefold()
+            ),
+            None,
+        )
+        if not selected:
+            send_event_object_selection(
+                message,
+                pending["event_type"],
+                pending["objects"],
+                "Об’єкт не знайдено. Оберіть його кнопкою.",
+            )
+            return True
+
+        pending["object"] = selected["name"]
+        pending["stage"] = "worker"
+        try:
+            pending["workers"] = get_active_workers()
+            error_text = "" if pending["workers"] else "Активних працівників не знайдено."
+        except Exception as error:
+            print(f"Worker directory loading failed: {error}")
+            pending["workers"] = []
+            error_text = "Не вдалося завантажити працівників."
+        send_event_worker_selection(message, pending, error_text)
+        return True
+
+    if pending.get("stage") == "worker":
+        if text == EVENT_SELF_TEXT:
+            pending["target_worker"] = None
+        else:
+            selected_worker = find_worker_option(text, pending["workers"])
+            if not selected_worker:
+                send_event_worker_selection(
+                    message,
+                    pending,
+                    "Працівника не знайдено. Оберіть його кнопкою або призначте запис собі.",
+                )
+                return True
+            pending["target_worker"] = selected_worker
+        pending["stage"] = "content"
+        send_event_content_prompt(message, pending)
+        return True
+
+    if pending.get("stage") == "content":
+        if not text:
+            markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            markup.row(KeyboardButton(EVENT_CANCEL_TEXT))
+            send_with_markup(
+                message,
+                f"{pending['event_type']} не може бути порожнім. Введіть текст одним повідомленням:",
+                markup,
+            )
+            return True
+        try:
+            sheet_title = append_event_to_sheet(
+                message,
+                pending["event_type"],
+                pending["object"],
+                text,
+                pending.get("target_worker"),
+            )
+        except Exception as error:
+            print(f"Event saving failed: {error}")
+            markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            markup.row(KeyboardButton(EVENT_CANCEL_TEXT))
+            send_with_markup(message, f"Не вдалося записати {event_noun(pending['event_type'])}. {error}", markup)
+            return True
+
+        object_name = pending["object"]
+        event_type = pending["event_type"]
+        target_name = (pending.get("target_worker") or {}).get("name") or get_user_name(message)
+        user["pending_event"] = None
+        send_with_keyboard(
+            message,
+            f"{event_type} записано у вкладку «{sheet_title}».\n"
+            f"Об’єкт: {object_name}\n"
+            f"{event_target_label(event_type)}: {target_name}",
+        )
+        return True
+
+    user["pending_event"] = None
+    return False
 
 
 def worker_button_text(worker):
@@ -2346,6 +2969,9 @@ def handle_text(message):
         handle_materials_text(message, text)
         return
 
+    if is_events_topic(message) and handle_events_text(message, text):
+        return
+
     if handle_delegate_text(message, text):
         return
 
@@ -2472,7 +3098,12 @@ def handle_materials_text(message, text):
     send_material_choice(message, text, forced_operation="Видача")
 
 
-print("Bot is running...")
-threading.Thread(target=weather_scheduler, daemon=True).start()
-threading.Thread(target=automatic_shift_closure_scheduler, daemon=True).start()
-bot.infinity_polling(skip_pending=True)
+def main():
+    print("Bot is running...")
+    threading.Thread(target=weather_scheduler, daemon=True).start()
+    threading.Thread(target=automatic_shift_closure_scheduler, daemon=True).start()
+    bot.infinity_polling(skip_pending=True)
+
+
+if __name__ == "__main__":
+    main()
