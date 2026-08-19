@@ -778,7 +778,7 @@ def main_keyboard():
 
 
 def events_keyboard():
-    markup = main_keyboard()
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(QUESTION_TEXT), KeyboardButton(TASK_TEXT))
     markup.row(KeyboardButton(ACTIVE_QUESTIONS_TEXT), KeyboardButton(ACTIVE_TASKS_TEXT))
     return markup

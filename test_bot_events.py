@@ -184,8 +184,13 @@ class BotEventsTests(unittest.TestCase):
 
     def test_events_keyboard_contains_two_distinct_buttons(self):
         rows = self.module.events_keyboard().rows
-        self.assertIn(["Питання", "Завдання"], rows)
-        self.assertIn(["Актуальні питання", "Актуальні завдання"], rows)
+        self.assertEqual(
+            rows,
+            [
+                ["Питання", "Завдання"],
+                ["Актуальні питання", "Актуальні завдання"],
+            ],
+        )
 
     def test_objects_sheet_is_created_only_when_missing_and_seeded_from_captures(self):
         captures = FakeWorksheet(
