@@ -192,6 +192,111 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
+    def test_my_status_cancels_same_topic_delegate_and_shows_actor(self):
+        message = self.message(self.module.STATUS_TEXT)
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        chat_id, thread_id = self.module.message_context(message)
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "datetime",
+            "worker": {
+                "telegram_user_id": "999",
+                "name": "Корчинський Іван",
+            },
+            "action": self.module.START_SHIFT_TEXT,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+
+        self.module.handle_text(message)
+
+        self.assertIsNone(actor["pending_delegate"])
+        response = self.module.bot.sent[-1][1]
+        self.assertIn("Працівник: Іван Петренко", response)
+        self.assertNotIn("Корчинський Іван", response)
+
+    def test_delegate_action_requires_final_confirmation(self):
+        message = self.message()
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        chat_id, thread_id = self.module.message_context(message)
+        worker = {
+            "telegram_user_id": "999",
+            "name": "Корчинський Іван",
+        }
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "datetime",
+            "worker": worker,
+            "action": self.module.START_BREAK_TEXT,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+        calls = []
+        original_start_break = self.module.start_break
+        self.module.start_break = lambda *args: calls.append(args)
+        try:
+            self.assertTrue(self.module.handle_delegate_text(message, "01.01.2026 08:00"))
+            self.assertEqual(actor["pending_delegate"]["stage"], "confirm")
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                self.module.bot.sent[-1][2]["reply_markup"].rows,
+                [["Підтвердити позначення"], ["Скасувати позначення"]],
+            )
+
+            self.assertTrue(
+                self.module.handle_delegate_text(
+                    message,
+                    self.module.DELEGATE_CONFIRM_TEXT,
+                )
+            )
+        finally:
+            self.module.start_break = original_start_break
+
+        self.assertIsNone(actor["pending_delegate"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], worker)
+
+    def test_delegated_shift_confirms_after_capture_selection(self):
+        message = self.message()
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        chat_id, thread_id = self.module.message_context(message)
+        worker = {
+            "telegram_user_id": "999",
+            "name": "Корчинський Іван",
+        }
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "datetime",
+            "worker": worker,
+            "action": self.module.START_SHIFT_TEXT,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+        calls = []
+        original_get_captures = self.module.get_active_captures
+        original_start_shift = self.module.start_shift
+        self.module.get_active_captures = lambda: [{"name": "Well Place"}]
+        self.module.start_shift = lambda *args: calls.append(args)
+        try:
+            self.assertTrue(self.module.handle_delegate_text(message, "01.01.2026 08:00"))
+            self.assertEqual(actor["pending_delegate"]["stage"], "capture")
+            self.assertTrue(self.module.handle_delegate_text(message, "Well Place"))
+            self.assertEqual(actor["pending_delegate"]["stage"], "confirm")
+            self.assertEqual(calls, [])
+            self.assertTrue(
+                self.module.handle_delegate_text(
+                    message,
+                    self.module.DELEGATE_CONFIRM_TEXT,
+                )
+            )
+        finally:
+            self.module.get_active_captures = original_get_captures
+            self.module.start_shift = original_start_shift
+
+        self.assertIsNone(actor["pending_delegate"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][3], {"name": "Well Place"})
+
     def test_objects_sheet_is_created_only_when_missing_and_seeded_from_captures(self):
         captures = FakeWorksheet(
             "Захватки",

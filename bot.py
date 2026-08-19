@@ -542,6 +542,7 @@ DEFECT_CONFIRM_TEXT = "Підтвердити дефектний акт"
 MATERIAL_OTHER_MASTER_TEXT = "Взяв інший майстер"
 MARK_FOR_MASTER_TEXT = "Позначити за майстра"
 DELEGATE_CANCEL_TEXT = "Скасувати позначення"
+DELEGATE_CONFIRM_TEXT = "Підтвердити позначення"
 QUESTION_TEXT = "Питання"
 TASK_TEXT = "Завдання"
 EVENT_CANCEL_TEXT = "Скасувати"
@@ -810,6 +811,19 @@ def is_events_topic(message):
         bool(EVENTS_CHAT_ID and EVENTS_THREAD_ID)
         and str(message.chat.id) == str(EVENTS_CHAT_ID)
         and str(thread_id) == str(EVENTS_THREAD_ID)
+    )
+
+
+def message_context(message):
+    thread_id = getattr(message, "message_thread_id", None)
+    return str(message.chat.id), "" if thread_id is None else str(thread_id)
+
+
+def pending_delegate_matches_message(pending, message):
+    chat_id, thread_id = message_context(message)
+    return (
+        str(pending.get("chat_id", "")) == chat_id
+        and str(pending.get("thread_id", "")) == thread_id
     )
 
 
@@ -1226,10 +1240,13 @@ def send_worker_selection(message, kind):
         return
 
     user = get_user(message.from_user.id, get_user_name(message))
+    chat_id, thread_id = message_context(message)
     user["pending_delegate"] = {
         "kind": kind,
         "stage": "worker",
         "workers": workers,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
     }
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     for worker in workers:
@@ -2465,15 +2482,65 @@ def send_operation_time_prompt(message, worker, action):
         f"Працівник: {worker['name']}\n"
         f"Подія: {action}\n\n"
         "Введіть фактичні дату й час події.\n"
-        "Формати: 08.08.2026 08:00, 2026-08-08 08:00 або 08:00 для сьогодні.",
+        "Формати: 08.08.2026 08:00, 2026-08-08 08:00 або 08:00 для сьогодні.\n"
+        "Після введення бот покаже підсумок для підтвердження.",
         markup,
     )
+
+
+def send_delegate_capture_prompt(message, pending, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for capture in pending["captures"]:
+        markup.row(KeyboardButton(capture["name"]))
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Оберіть захватку для цієї зміни:",
+        markup,
+    )
+
+
+def send_delegate_confirmation(message, pending, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DELEGATE_CONFIRM_TEXT))
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    capture = pending.get("capture") or {}
+    capture_line = f"\nЗахватка: {capture.get('name')}" if capture.get("name") else ""
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Перевірте позначення:\n"
+        f"Працівник: {pending['worker']['name']}\n"
+        f"Подія: {pending['action']}\n"
+        f"Дата й час: {format_datetime(pending['operation_time'])}"
+        f"{capture_line}\n\n"
+        "Підтвердьте або скасуйте позначення.",
+        markup,
+    )
+
+
+def complete_delegate_operation(message, pending):
+    action = pending["action"]
+    worker = pending["worker"]
+    operation_time = pending["operation_time"]
+    if action == START_SHIFT_TEXT:
+        start_shift(message, worker, operation_time, pending["capture"])
+    elif action == END_SHIFT_TEXT:
+        end_shift(message, worker, operation_time)
+    elif action == START_BREAK_TEXT:
+        start_break(message, worker, operation_time)
+    else:
+        stop_break(message, worker, operation_time)
 
 
 def handle_delegate_text(message, text):
     actor = get_user(message.from_user.id, get_user_name(message))
     pending = actor.get("pending_delegate")
     if not pending:
+        return False
+
+    if not pending_delegate_matches_message(pending, message):
         return False
 
     if text == DELEGATE_CANCEL_TEXT:
@@ -2535,22 +2602,11 @@ def handle_delegate_text(message, text):
                 return True
             pending["captures"] = captures
             pending["stage"] = "capture"
-            markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-            for capture in captures:
-                markup.row(KeyboardButton(capture["name"]))
-            markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
-            send_with_markup(message, "Оберіть захватку для цієї зміни:", markup)
+            send_delegate_capture_prompt(message, pending)
             return True
 
-        actor["pending_delegate"] = None
-        action = pending["action"]
-        worker = pending["worker"]
-        if action == END_SHIFT_TEXT:
-            end_shift(message, worker, operation_time)
-        elif action == START_BREAK_TEXT:
-            start_break(message, worker, operation_time)
-        else:
-            stop_break(message, worker, operation_time)
+        pending["stage"] = "confirm"
+        send_delegate_confirmation(message, pending)
         return True
 
     if pending["stage"] == "capture":
@@ -2559,10 +2615,23 @@ def handle_delegate_text(message, text):
             None,
         )
         if not capture:
-            send_with_keyboard(message, "Захватку не знайдено. Оберіть її кнопкою або скасуйте операцію.")
+            send_delegate_capture_prompt(
+                message,
+                pending,
+                "Захватку не знайдено. Оберіть її кнопкою.",
+            )
+            return True
+        pending["capture"] = capture
+        pending["stage"] = "confirm"
+        send_delegate_confirmation(message, pending)
+        return True
+
+    if pending["stage"] == "confirm":
+        if text != DELEGATE_CONFIRM_TEXT:
+            send_delegate_confirmation(message, pending, "Оберіть дію кнопкою.")
             return True
         actor["pending_delegate"] = None
-        start_shift(message, pending["worker"], pending["operation_time"], capture)
+        complete_delegate_operation(message, pending)
         return True
 
     return False
@@ -2970,6 +3039,15 @@ def handle_text(message):
         return
 
     if is_events_topic(message) and handle_events_text(message, text):
+        return
+
+    if text == STATUS_TEXT:
+        user = get_user(message.from_user.id, get_user_name(message))
+        pending_delegate = user.get("pending_delegate") or {}
+        if pending_delegate_matches_message(pending_delegate, message):
+            user["pending_delegate"] = None
+            user["material_for_worker"] = None
+        show_status(message)
         return
 
     if handle_delegate_text(message, text):
