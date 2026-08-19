@@ -2469,9 +2469,13 @@ def cancel_material_operation(message):
 
 def cancel_delegate(message):
     user = get_user(message.from_user.id, get_user_name(message))
-    user["pending_delegate"] = None
-    user["material_for_worker"] = None
-    send_with_keyboard(message, "Позначення за іншого працівника скасовано.")
+    pending = user.get("pending_delegate") or {}
+    if pending_delegate_matches_message(pending, message):
+        user["pending_delegate"] = None
+        user["material_for_worker"] = None
+        send_with_keyboard(message, "Позначення за іншого працівника скасовано.")
+        return
+    send_with_keyboard(message, "Активного позначення в цій гілці немає.")
 
 
 def send_operation_time_prompt(message, worker, action):
@@ -3053,6 +3057,10 @@ def handle_text(message):
     if handle_delegate_text(message, text):
         return
 
+    if text == DELEGATE_CANCEL_TEXT:
+        cancel_delegate(message)
+        return
+
     commands_map = {
         START_SHIFT_TEXT: start_shift,
         START_BREAK_TEXT: start_break,
@@ -3089,6 +3097,10 @@ def handle_text(message):
 
 def handle_materials_text(message, text):
     if handle_delegate_text(message, text):
+        return
+
+    if text == DELEGATE_CANCEL_TEXT:
+        cancel_delegate(message)
         return
 
     if text == MATERIAL_OTHER_MASTER_TEXT:

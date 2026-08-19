@@ -297,6 +297,35 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][3], {"name": "Well Place"})
 
+    def test_stale_delegate_cancel_is_handled_as_command(self):
+        message = self.message(self.module.DELEGATE_CANCEL_TEXT)
+
+        self.module.handle_text(message)
+
+        response = self.module.bot.sent[-1][1]
+        self.assertEqual(response, "Активного позначення в цій гілці немає.")
+        self.assertNotIn("Текст звернення", response)
+
+    def test_delegate_cancel_does_not_clear_another_topic(self):
+        message = self.message(self.module.DELEGATE_CANCEL_TEXT)
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "datetime",
+            "worker": {"telegram_user_id": "999", "name": "Корчинський Іван"},
+            "action": self.module.START_SHIFT_TEXT,
+            "chat_id": str(message.chat.id),
+            "thread_id": "999999",
+        }
+
+        self.module.handle_text(message)
+
+        self.assertIsNotNone(actor["pending_delegate"])
+        self.assertEqual(
+            self.module.bot.sent[-1][1],
+            "Активного позначення в цій гілці немає.",
+        )
+
     def test_objects_sheet_is_created_only_when_missing_and_seeded_from_captures(self):
         captures = FakeWorksheet(
             "Захватки",
