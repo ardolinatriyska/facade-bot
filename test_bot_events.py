@@ -215,6 +215,76 @@ class BotEventsTests(unittest.TestCase):
         self.assertIn("Працівник: Іван Петренко", response)
         self.assertNotIn("Корчинський Іван", response)
 
+    def test_delegate_action_offers_current_or_other_time(self):
+        message = self.message(self.module.START_SHIFT_TEXT)
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        chat_id, thread_id = self.module.message_context(message)
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "action",
+            "worker": {
+                "telegram_user_id": "999",
+                "name": "Корчинський Іван",
+            },
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+
+        self.assertTrue(self.module.handle_delegate_text(message, message.text))
+
+        self.assertEqual(actor["pending_delegate"]["stage"], "time_choice")
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            [
+                ["Поточний час"],
+                ["Вказати інший час"],
+                ["Скасувати позначення"],
+            ],
+        )
+
+    def test_delegated_current_time_shift_returns_main_keyboard_after_confirmation(self):
+        message = self.message(self.module.DELEGATE_NOW_TEXT)
+        message.message_thread_id = 777777
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        chat_id, thread_id = self.module.message_context(message)
+        actor["pending_delegate"] = {
+            "kind": "shift",
+            "stage": "time_choice",
+            "worker": {
+                "telegram_user_id": "999",
+                "name": "Корчинський Іван",
+            },
+            "action": self.module.START_SHIFT_TEXT,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+        original_get_captures = self.module.get_active_captures
+        self.module.get_active_captures = lambda: [
+            {"name": "Well Place", "project": "Well Place 2"}
+        ]
+        try:
+            self.assertTrue(
+                self.module.handle_delegate_text(message, self.module.DELEGATE_NOW_TEXT)
+            )
+            self.assertEqual(actor["pending_delegate"]["stage"], "capture")
+            self.assertTrue(self.module.handle_delegate_text(message, "Well Place"))
+            self.assertEqual(actor["pending_delegate"]["stage"], "confirm")
+            self.assertTrue(
+                self.module.handle_delegate_text(
+                    message,
+                    self.module.DELEGATE_CONFIRM_TEXT,
+                )
+            )
+        finally:
+            self.module.get_active_captures = original_get_captures
+
+        self.assertIsNone(actor["pending_delegate"])
+        self.assertIn("Початок зміни зафіксовано", self.module.bot.sent[-1][1])
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.main_keyboard().rows,
+        )
+
     def test_delegate_action_requires_final_confirmation(self):
         message = self.message()
         actor = self.module.get_user(message.from_user.id, "Іван Петренко")

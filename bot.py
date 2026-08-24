@@ -543,6 +543,8 @@ MATERIAL_OTHER_MASTER_TEXT = "Взяв інший майстер"
 MARK_FOR_MASTER_TEXT = "Позначити за майстра"
 DELEGATE_CANCEL_TEXT = "Скасувати позначення"
 DELEGATE_CONFIRM_TEXT = "Підтвердити позначення"
+DELEGATE_NOW_TEXT = "Поточний час"
+DELEGATE_OTHER_TIME_TEXT = "Вказати інший час"
 QUESTION_TEXT = "Питання"
 TASK_TEXT = "Завдання"
 EVENT_CANCEL_TEXT = "Скасувати"
@@ -2478,16 +2480,33 @@ def cancel_delegate(message):
     send_with_keyboard(message, "Активного позначення в цій гілці немає.")
 
 
-def send_operation_time_prompt(message, worker, action):
+def send_operation_time_choice(message, worker, action, error_text=""):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DELEGATE_NOW_TEXT))
+    markup.row(KeyboardButton(DELEGATE_OTHER_TIME_TEXT))
     markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
     send_with_markup(
         message,
-        f"Працівник: {worker['name']}\n"
+        f"{prefix}Працівник: {worker['name']}\n"
+        f"Подія: {action}\n\n"
+        "Оберіть поточний час або вкажіть інший фактичний час події.",
+        markup,
+    )
+
+
+def send_operation_time_prompt(message, worker, action, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(DELEGATE_NOW_TEXT))
+    markup.row(KeyboardButton(DELEGATE_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Працівник: {worker['name']}\n"
         f"Подія: {action}\n\n"
         "Введіть фактичні дату й час події.\n"
         "Формати: 08.08.2026 08:00, 2026-08-08 08:00 або 08:00 для сьогодні.\n"
-        "Після введення бот покаже підсумок для підтвердження.",
+        "Або натисніть «Поточний час».",
         markup,
     )
 
@@ -2538,6 +2557,33 @@ def complete_delegate_operation(message, pending):
         stop_break(message, worker, operation_time)
 
 
+def continue_delegate_with_time(message, actor, pending, operation_time):
+    if operation_time > now_dt() + timedelta(minutes=1):
+        pending["stage"] = "datetime"
+        send_operation_time_prompt(
+            message,
+            pending["worker"],
+            pending["action"],
+            "Не можна вказати час у майбутньому.",
+        )
+        return
+
+    pending["operation_time"] = operation_time
+    if pending["action"] == START_SHIFT_TEXT:
+        captures = get_active_captures()
+        if not captures:
+            actor["pending_delegate"] = None
+            send_with_keyboard(message, "Немає активних захваток у таблиці «Захватки».")
+            return
+        pending["captures"] = captures
+        pending["stage"] = "capture"
+        send_delegate_capture_prompt(message, pending)
+        return
+
+    pending["stage"] = "confirm"
+    send_delegate_confirmation(message, pending)
+
+
 def handle_delegate_text(message, text):
     actor = get_user(message.from_user.id, get_user_name(message))
     pending = actor.get("pending_delegate")
@@ -2583,34 +2629,41 @@ def handle_delegate_text(message, text):
             send_with_markup(message, "Оберіть подію кнопкою.", delegate_action_keyboard())
             return True
         pending["action"] = text
-        pending["stage"] = "datetime"
-        send_operation_time_prompt(message, pending["worker"], text)
+        pending["stage"] = "time_choice"
+        send_operation_time_choice(message, pending["worker"], text)
+        return True
+
+    if pending["stage"] == "time_choice":
+        if text == DELEGATE_NOW_TEXT:
+            continue_delegate_with_time(message, actor, pending, now_dt())
+            return True
+        if text == DELEGATE_OTHER_TIME_TEXT:
+            pending["stage"] = "datetime"
+            send_operation_time_prompt(message, pending["worker"], pending["action"])
+            return True
+        send_operation_time_choice(
+            message,
+            pending["worker"],
+            pending["action"],
+            "Оберіть час кнопкою.",
+        )
         return True
 
     if pending["stage"] == "datetime":
-        try:
-            operation_time = parse_operation_datetime(text)
-        except ValueError:
-            send_operation_time_prompt(message, pending["worker"], pending["action"])
-            return True
-        if operation_time > now_dt() + timedelta(minutes=1):
-            send_with_keyboard(message, "Не можна вказати час у майбутньому. Введіть фактичний минулий час.")
-            return True
-
-        pending["operation_time"] = operation_time
-        if pending["action"] == START_SHIFT_TEXT:
-            captures = get_active_captures()
-            if not captures:
-                actor["pending_delegate"] = None
-                send_with_keyboard(message, "Немає активних захваток у таблиці «Захватки».")
+        if text == DELEGATE_NOW_TEXT:
+            operation_time = now_dt()
+        else:
+            try:
+                operation_time = parse_operation_datetime(text)
+            except ValueError:
+                send_operation_time_prompt(
+                    message,
+                    pending["worker"],
+                    pending["action"],
+                    "Не вдалося розпізнати дату й час.",
+                )
                 return True
-            pending["captures"] = captures
-            pending["stage"] = "capture"
-            send_delegate_capture_prompt(message, pending)
-            return True
-
-        pending["stage"] = "confirm"
-        send_delegate_confirmation(message, pending)
+        continue_delegate_with_time(message, actor, pending, operation_time)
         return True
 
     if pending["stage"] == "capture":
