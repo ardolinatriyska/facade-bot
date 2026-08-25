@@ -220,6 +220,17 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(text, "Тестовий прогноз")
         self.assertNotIn("message_thread_id", options)
 
+    def test_materials_keyboard_adds_order_only_next_to_balance(self):
+        self.assertEqual(
+            self.module.materials_keyboard().rows,
+            [
+                [self.module.MATERIALS_TEXT, self.module.MATERIAL_RETURN_TEXT],
+                [self.module.INVENTORY_TEXT, self.module.DEFECT_TEXT],
+                [self.module.BALANCE_TEXT, self.module.MATERIAL_ORDER_TEXT],
+                [self.module.MATERIAL_OTHER_MASTER_TEXT],
+            ],
+        )
+
     def test_material_issue_selects_capture_confirms_and_saves_it(self):
         message = self.materials_topic_message(self.module.MATERIALS_TEXT)
         capture = {
@@ -332,6 +343,211 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
             self.module.materials_keyboard().rows,
+        )
+
+    def test_material_order_keeps_order_mode_confirms_and_saves_it(self):
+        message = self.materials_topic_message(self.module.MATERIAL_ORDER_TEXT)
+        capture = {
+            "capture_id": "capture-5",
+            "name": "5 Велика",
+            "project": "Well Place",
+        }
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        fixed_now = self.module.datetime(
+            2026,
+            8,
+            25,
+            11,
+            45,
+            tzinfo=self.module.KYIV_TZ,
+        )
+        movement_calls = []
+
+        originals = {
+            "get_active_captures": self.module.get_active_captures,
+            "get_material_catalog": self.module.get_material_catalog,
+            "find_material_candidates": self.module.find_material_candidates,
+            "interpret_material_with_ai": self.module.interpret_material_with_ai,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+            "now_dt": self.module.now_dt,
+        }
+        self.module.get_active_captures = lambda: [capture]
+        self.module.get_material_catalog = lambda: [material]
+        self.module.find_material_candidates = lambda text: [material]
+        self.module.interpret_material_with_ai = lambda text, catalog: None
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = (
+            lambda *args, **kwargs: movement_calls.append((args, kwargs))
+        )
+        self.module.now_dt = lambda: fixed_now
+
+        try:
+            self.module.handle_text(message)
+            actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+            self.assertEqual(actor["pending_material"]["kind"], "issue_capture")
+            self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
+            self.assertIn("замовляємо матеріал", self.module.bot.sent[-1][1])
+
+            message.text = "5 Велика"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "issue_input")
+            self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
+            self.assertEqual(actor["pending_material"]["capture"], capture)
+            self.assertIn(
+                "Який матеріал замовляємо та яка кількість?",
+                self.module.bot.sent[-1][1],
+            )
+
+            message.text = "Клей фасадний"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "issue_input")
+            self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
+            self.assertIn("Не бачу кількості", self.module.bot.sent[-1][1])
+            self.assertIn("матеріал замовляємо", self.module.bot.sent[-1][1])
+
+            message.text = "Клей фасадний 4"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "material")
+            self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
+            self.assertEqual(actor["pending_material"]["capture"], capture)
+            self.assertIn("Замовлення: 4 міш.", self.module.bot.sent[-1][1])
+            self.assertIn("Захватка: 5 Велика", self.module.bot.sent[-1][1])
+
+            message.text = self.module.MATERIAL_CONFIRM_TEXT
+            self.module.handle_text(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertEqual(len(movement_calls), 1)
+        movement_args, movement_kwargs = movement_calls[0]
+        self.assertEqual(movement_args[3], "Замовлення")
+        self.assertEqual(movement_args[4], 4)
+        self.assertEqual(movement_kwargs, {})
+        self.assertEqual(len(log_sheet.appended), 1)
+        appended_values, _ = log_sheet.appended[0]
+        self.assertEqual(appended_values[1], "Замовлення")
+        self.assertEqual(appended_values[2], "Клей фасадний")
+        self.assertEqual(appended_values[3], 4)
+        self.assertEqual(appended_values[4], "міш.")
+        self.assertEqual(appended_values[5], "5 Велика")
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.materials_keyboard().rows,
+        )
+
+    def test_material_order_cancel_returns_materials_keyboard_without_writes(self):
+        message = self.materials_topic_message(self.module.MATERIAL_CANCEL_TEXT)
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["pending_material"] = {
+            "kind": "issue_capture",
+            "operation": "Замовлення",
+            "captures": [{"name": "5 Велика"}],
+        }
+
+        self.module.handle_text(message)
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertIn("скасовано", self.module.bot.sent[-1][1].lower())
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.materials_keyboard().rows,
+        )
+
+    def test_order_sync_updates_only_the_material_order_column(self):
+        class Cell:
+            def __init__(self, value=""):
+                self.value = value
+
+        class MovementWorksheet:
+            def row_values(self, row):
+                if row == 2:
+                    return ["", "", "", "", "", "Прийнято", "Видано", "Замовлення"]
+                if row == 3:
+                    return ["", "", "", "", "", "Клей фасадний", "", ""]
+                return []
+
+            def get(self, cell_range):
+                if cell_range == "A1:D200":
+                    return [[], [], [], [], ["25.08.2026", "", "", ""]]
+                if cell_range == "B5:D5":
+                    return [["", "", ""]]
+                raise AssertionError(f"Unexpected range: {cell_range}")
+
+            def acell(self, cell):
+                return Cell({"A5": "25.08.2026", "H5": "2"}.get(cell, ""))
+
+        class MovementSpreadsheet:
+            def __init__(self, worksheet):
+                self.movement = worksheet
+                self.batch_updates = []
+
+            def worksheet(self, title):
+                self.assert_title = title
+                return self.movement
+
+            def values_batch_update(self, payload):
+                self.batch_updates.append(payload)
+
+        worksheet = MovementWorksheet()
+        spreadsheet = MovementSpreadsheet(worksheet)
+        message = self.materials_topic_message()
+        timestamp = self.module.datetime(
+            2026,
+            8,
+            25,
+            12,
+            0,
+            tzinfo=self.module.KYIV_TZ,
+        )
+
+        row_number = self.module.sync_daily_material_movement(
+            spreadsheet,
+            message,
+            {"Матеріал": "Клей фасадний", "Синоніми": ""},
+            "Замовлення",
+            3,
+            {"name": "Іван Петренко"},
+            timestamp,
+        )
+
+        self.assertEqual(row_number, 5)
+        self.assertEqual(spreadsheet.assert_title, self.module.DAILY_MATERIAL_SHEET)
+        self.assertEqual(len(spreadsheet.batch_updates), 1)
+        data = spreadsheet.batch_updates[0]["data"]
+        self.assertEqual(
+            data,
+            [
+                {
+                    "range": "'Рух матеріалів'!B5:D5",
+                    "values": [[
+                        "Замовлення через RAHUY Bot",
+                        "Іван Петренко",
+                        "Іван Петренко",
+                    ]],
+                },
+                {"range": "'Рух матеріалів'!H5", "values": [[5.0]]},
+            ],
         )
 
     def test_bot_topic_keyboard_contains_exactly_three_buttons(self):

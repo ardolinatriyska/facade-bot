@@ -537,6 +537,7 @@ MATERIALS_TEXT = "Взяв"
 MATERIAL_RETURN_TEXT = "Повернув"
 INVENTORY_TEXT = "Інвентаризація"
 BALANCE_TEXT = "Перевірити залишок"
+MATERIAL_ORDER_TEXT = "Замовити"
 DEFECT_TEXT = "Дефектний акт"
 MATERIAL_CONFIRM_TEXT = "Підтвердити"
 MATERIAL_CANCEL_TEXT = "Скасувати матеріал"
@@ -860,7 +861,7 @@ def materials_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(MATERIALS_TEXT), KeyboardButton(MATERIAL_RETURN_TEXT))
     markup.row(KeyboardButton(INVENTORY_TEXT), KeyboardButton(DEFECT_TEXT))
-    markup.row(KeyboardButton(BALANCE_TEXT))
+    markup.row(KeyboardButton(BALANCE_TEXT), KeyboardButton(MATERIAL_ORDER_TEXT))
     markup.row(KeyboardButton(MATERIAL_OTHER_MASTER_TEXT))
     return markup
 
@@ -1439,7 +1440,7 @@ def send_material_for_worker_prompt(message, worker, error_text=""):
     )
 
 
-def start_material_issue(message, error_text=""):
+def start_material_issue(message, error_text="", operation="Видача"):
     try:
         captures = get_active_captures()
     except Exception as error:
@@ -1457,32 +1458,44 @@ def start_material_issue(message, error_text=""):
     user["pending_material"] = {
         "kind": "issue_capture",
         "captures": captures,
+        "operation": operation,
     }
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     for capture in captures:
         markup.row(KeyboardButton(capture["name"]))
     markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
     prefix = f"{error_text}\n\n" if error_text else ""
+    capture_question = (
+        "Для якої захватки замовляємо матеріал?"
+        if operation == "Замовлення"
+        else "Для якої захватки беремо матеріал?"
+    )
     send_with_markup(
         message,
-        f"{prefix}Для якої захватки беремо матеріал?",
+        f"{prefix}{capture_question}",
         markup,
     )
 
 
-def send_material_issue_input_prompt(message, capture, error_text=""):
+def send_material_issue_input_prompt(message, capture, error_text="", operation="Видача"):
     user = get_user(message.from_user.id, get_user_name(message))
     user["pending_material"] = {
         "kind": "issue_input",
         "capture": capture,
+        "operation": operation,
     }
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
     prefix = f"{error_text}\n\n" if error_text else ""
+    input_question = (
+        "Який матеріал замовляємо та яка кількість?"
+        if operation == "Замовлення"
+        else "Який матеріал беремо та яка кількість?"
+    )
     send_with_markup(
         message,
         f"{prefix}Захватка: {capture['name']}\n\n"
-        "Який матеріал беремо та яка кількість?",
+        f"{input_question}",
         markup,
     )
 
@@ -2047,6 +2060,7 @@ def send_material_choice(message, text, forced_operation=None):
     user = get_user(message.from_user.id, get_user_name(message))
     current_pending = user.get("pending_material") or {}
     capture = current_pending.get("capture")
+    operation = forced_operation or current_pending.get("operation") or "Видача"
     target_worker = user.get("material_for_worker")
     quantity = extract_material_quantity(text)
     catalog = get_material_catalog()
@@ -2066,7 +2080,12 @@ def send_material_choice(message, text, forced_operation=None):
         if target_worker:
             send_material_for_worker_prompt(message, target_worker, error_text)
         elif capture:
-            send_material_issue_input_prompt(message, capture, error_text)
+            send_material_issue_input_prompt(
+                message,
+                capture,
+                error_text,
+                operation=operation,
+            )
         else:
             send_with_keyboard(
                 message,
@@ -2079,14 +2098,19 @@ def send_material_choice(message, text, forced_operation=None):
         if target_worker:
             send_material_for_worker_prompt(message, target_worker, error_text)
         elif capture:
-            send_material_issue_input_prompt(message, capture, error_text)
+            send_material_issue_input_prompt(
+                message,
+                capture,
+                error_text,
+                operation=operation,
+            )
         else:
             send_with_keyboard(message, error_text + " Або додамо для нього синонім.")
         return False
 
     user["pending_material"] = {
         "kind": "material",
-        "operation": forced_operation or "Видача",
+        "operation": operation,
         "quantity": quantity,
         "candidates": candidates,
         "selected": None,
@@ -3393,6 +3417,10 @@ def handle_materials_text(message, text):
         start_balance_check(message)
         return
 
+    if text == MATERIAL_ORDER_TEXT:
+        start_material_issue(message, operation="Замовлення")
+        return
+
     if text == INVENTORY_TEXT:
         start_inventory(message, text)
         return
@@ -3439,17 +3467,26 @@ def handle_materials_text(message, text):
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
     if pending and pending.get("kind") == "issue_capture":
+        operation = pending.get("operation") or "Видача"
         capture = next(
             (item for item in pending.get("captures", []) if item.get("name") == text),
             None,
         )
         if not capture:
-            start_material_issue(message, "Захватку не знайдено. Оберіть її кнопкою.")
+            start_material_issue(
+                message,
+                "Захватку не знайдено. Оберіть її кнопкою.",
+                operation=operation,
+            )
             return
-        send_material_issue_input_prompt(message, capture)
+        send_material_issue_input_prompt(message, capture, operation=operation)
         return
     if pending and pending.get("kind") == "issue_input":
-        send_material_choice(message, text, forced_operation="Видача")
+        send_material_choice(
+            message,
+            text,
+            forced_operation=pending.get("operation") or "Видача",
+        )
         return
     if pending and pending.get("kind") in {"defect_input", "defect_choice"}:
         choose_defect_material(message, text, pending)
@@ -3475,7 +3512,11 @@ def handle_materials_text(message, text):
     if pending and select_material_candidate(message, text):
         return
 
-    send_material_choice(message, text, forced_operation="Видача")
+    send_material_choice(
+        message,
+        text,
+        forced_operation=(pending or {}).get("operation") or "Видача",
+    )
 
 
 def main():
