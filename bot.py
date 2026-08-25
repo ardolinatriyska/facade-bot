@@ -1861,6 +1861,15 @@ def find_material_candidates(text):
             candidates.append((score, row))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
+    normalized = normalize_material_text(text)
+    exact_candidates = [
+        row
+        for _, row in candidates
+        if normalized == normalize_material_text(row.get("Матеріал", ""))
+        or normalized in material_aliases(row)
+    ]
+    if exact_candidates:
+        return exact_candidates[:3]
     return [row for _, row in candidates[:3]]
 
 

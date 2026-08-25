@@ -550,6 +550,145 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
+    def test_exact_foam_50_alias_excludes_other_thicknesses(self):
+        foam_50 = {
+            "Матеріал": "Пінопласт 50 мм",
+            "Група": "Утеплювачі",
+            "Од. виміру / примітка": "м.кв.",
+            "Синоніми": "пінопласт 50, EPS 50, пінопласт 5 см",
+        }
+        foam_150 = {
+            "Матеріал": "Пінопласт 150 мм",
+            "Група": "Утеплювачі",
+            "Од. виміру / примітка": "м.кв.",
+            "Синоніми": "пінопласт 150, EPS 150, пінопласт 15 см",
+        }
+        original_get_material_catalog = self.module.get_material_catalog
+        self.module.get_material_catalog = lambda: [foam_50, foam_150]
+        try:
+            candidates = self.module.find_material_candidates("пінопласт 50")
+        finally:
+            self.module.get_material_catalog = original_get_material_catalog
+
+        self.assertEqual(candidates, [foam_50])
+
+    def test_invoice_foam_cubic_quantity_is_saved_as_square_metres(self):
+        material = {
+            "Матеріал": "Пінопласт 50 мм",
+            "Група": "Утеплювачі",
+            "Постачальник": "СУПТзОВ «Термобуд»",
+            "Од. виміру / примітка": "м.кв.",
+            "Синоніми": "пінопласт 50, EPS 50, пінопласт 5 см",
+        }
+        ai_output = {
+            "supplier": "Термобуд",
+            "invoice_number": "N-50",
+            "invoice_date": "25.08.2026",
+            "items": [{
+                "material": "Пінопласт 50 мм",
+                "raw_name": "Пінопласт 50 мм",
+                "quantity": 6.18,
+                "unit": "м³",
+                "confidence": 0.99,
+            }],
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self):
+                payload = {"output_text": json.dumps(ai_output, ensure_ascii=False)}
+                return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        fixed_now = self.module.datetime(
+            2026,
+            8,
+            25,
+            13,
+            20,
+            tzinfo=self.module.KYIV_TZ,
+        )
+        movement_calls = []
+        originals = {
+            "OPENAI_API_KEY": self.module.OPENAI_API_KEY,
+            "urlopen": self.module.urllib.request.urlopen,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+            "now_dt": self.module.now_dt,
+        }
+        self.module.OPENAI_API_KEY = "test-openai-key"
+        self.module.urllib.request.urlopen = lambda request, timeout: FakeResponse()
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = (
+            lambda *args, **kwargs: movement_calls.append((args, kwargs))
+        )
+        self.module.now_dt = lambda: fixed_now
+
+        try:
+            invoice = self.module.interpret_invoice_photo_with_ai(b"fake-image", [material])
+            self.assertEqual(invoice["items"][0]["quantity"], 123.6)
+            self.assertEqual(invoice["items"][0]["unit"], "м.кв.")
+            self.assertEqual(invoice["items"][0]["source_quantity"], 6.18)
+            self.assertEqual(invoice["items"][0]["source_unit"], "м³")
+            self.assertEqual(invoice["items"][0]["thickness_mm"], 50)
+
+            message = self.materials_topic_message(self.module.INVOICE_CONFIRM_TEXT)
+            actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+            actor["pending_material"] = {"kind": "invoice", "invoice": invoice}
+            self.module.handle_text(message)
+        finally:
+            self.module.OPENAI_API_KEY = originals["OPENAI_API_KEY"]
+            self.module.urllib.request.urlopen = originals["urlopen"]
+            for name in (
+                "get_worker",
+                "get_sheet",
+                "get_or_create_worksheet",
+                "sync_daily_material_movement",
+                "now_dt",
+            ):
+                setattr(self.module, name, originals[name])
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertEqual(len(movement_calls), 1)
+        movement_args, movement_kwargs = movement_calls[0]
+        self.assertEqual(movement_args[3], "Надходження")
+        self.assertEqual(movement_args[4], 123.6)
+        self.assertEqual(movement_kwargs, {"source_name": "Термобуд"})
+
+        self.assertEqual(len(log_sheet.appended), 1)
+        appended_values, _ = log_sheet.appended[0]
+        self.assertEqual(appended_values[1], "Надходження за накладною")
+        self.assertEqual(appended_values[2], "Пінопласт 50 мм")
+        self.assertEqual(appended_values[3], 123.6)
+        self.assertEqual(appended_values[4], "м.кв.")
+        self.assertIn(
+            "Перерахунок: 6.18 м³ → 123.6 м.кв.; товщина 50 мм",
+            appended_values[8],
+        )
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.materials_keyboard().rows,
+        )
+
     def test_bot_topic_keyboard_contains_exactly_three_buttons(self):
         self.assertEqual(
             self.module.bot_topic_keyboard().rows,
