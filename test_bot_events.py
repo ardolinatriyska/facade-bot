@@ -182,6 +182,12 @@ class BotEventsTests(unittest.TestCase):
             reply_to_message=None,
         )
 
+    def bot_topic_message(self, text=""):
+        message = self.message(text)
+        message.message_thread_id = int(self.module.BOT_TOPIC_THREAD_ID)
+        message.chat.id = int(self.module.BOT_TOPIC_CHAT_ID)
+        return message
+
     def test_events_keyboard_contains_two_distinct_buttons(self):
         rows = self.module.events_keyboard().rows
         self.assertEqual(
@@ -190,6 +196,92 @@ class BotEventsTests(unittest.TestCase):
                 ["Питання", "Завдання"],
                 ["Актуальні питання", "Актуальні завдання"],
             ],
+        )
+
+    def test_bot_topic_keyboard_contains_only_shift_summary_and_status(self):
+        self.assertEqual(
+            self.module.bot_topic_keyboard().rows,
+            [["Хто на зміні", "Мій статус"]],
+        )
+        self.assertNotIn(
+            "Хто на зміні",
+            [button for row in self.module.main_keyboard().rows for button in row],
+        )
+
+    def test_bot_topic_status_returns_bot_topic_keyboard(self):
+        message = self.bot_topic_message(self.module.STATUS_TEXT)
+
+        self.module.handle_text(message)
+
+        self.assertIn("Статус: поза зміною", self.module.bot.sent[-1][1])
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            [["Хто на зміні", "Мій статус"]],
+        )
+
+    def test_who_is_on_shift_combines_active_and_today_completed_read_only(self):
+        message = self.bot_topic_message(self.module.WHO_ON_SHIFT_TEXT)
+        fixed_now = self.module.datetime(
+            2026,
+            8,
+            25,
+            12,
+            0,
+            tzinfo=self.module.KYIV_TZ,
+        )
+        active = self.module.get_user("999", "Майба Павло")
+        active.update({
+            "shift_started": True,
+            "shift_start_time": fixed_now.replace(hour=8, minute=15),
+            "break_active": False,
+            "shift_worker": {"name": "Майба Павло"},
+        })
+        shifts = FakeWorksheet(
+            "Зміни",
+            headers=self.module.SHIFT_HEADERS,
+            records=[
+                {
+                    "дата": "25.08.2026",
+                    "працівник": "Корчинський Іван",
+                    "початок зміни": "25.08.2026 07:30:00",
+                    "кінець зміни": "25.08.2026 11:45:00",
+                    "загальна тривалість": "04:15:00",
+                    "перерви": "00:20:00",
+                },
+                {
+                    "дата": "24.08.2026",
+                    "працівник": "Учорашній Працівник",
+                    "початок зміни": "24.08.2026 08:00:00",
+                    "кінець зміни": "24.08.2026 17:00:00",
+                    "загальна тривалість": "09:00:00",
+                    "перерви": "00:30:00",
+                },
+            ],
+        )
+        spreadsheet = FakeSpreadsheet([shifts])
+        original_get_sheet = self.module.get_sheet
+        original_now_dt = self.module.now_dt
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.now_dt = lambda: fixed_now
+        try:
+            self.module.handle_text(message)
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.now_dt = original_now_dt
+
+        self.assertEqual(len(self.module.bot.sent), 1)
+        response = self.module.bot.sent[-1][1]
+        self.assertIn("Майба Павло — початок 08:15 (на зміні)", response)
+        self.assertIn("Корчинський Іван", response)
+        self.assertIn("Початок: 07:30 · Кінець: 11:45", response)
+        self.assertIn("Перерви: 00:20:00 · Тривалість зміни: 04:15:00", response)
+        self.assertNotIn("Учорашній Працівник", response)
+        self.assertEqual(shifts.updated, [])
+        self.assertEqual(shifts.appended, [])
+        self.assertEqual(shifts.cell_updates, [])
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            [["Хто на зміні", "Мій статус"]],
         )
 
     def test_my_status_cancels_same_topic_delegate_and_shows_actor(self):

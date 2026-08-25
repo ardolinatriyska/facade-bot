@@ -36,6 +36,8 @@ WEATHER_CHAT_ID = -1004258418040
 WEATHER_THREAD_ID = 1
 EVENTS_CHAT_ID = os.getenv("EVENTS_CHAT_ID", str(WEATHER_CHAT_ID))
 EVENTS_THREAD_ID = os.getenv("EVENTS_THREAD_ID", str(WEATHER_THREAD_ID))
+BOT_TOPIC_CHAT_ID = os.getenv("BOT_TOPIC_CHAT_ID", str(WEATHER_CHAT_ID))
+BOT_TOPIC_THREAD_ID = os.getenv("BOT_TOPIC_THREAD_ID", "82")
 WEATHER_LATITUDE = 49.8157
 WEATHER_LONGITUDE = 24.1346
 
@@ -529,6 +531,7 @@ STOP_BREAK_TEXT = "Стоп перерви"
 SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
+WHO_ON_SHIFT_TEXT = "Хто на зміні"
 MATERIALS_TEXT = "Взяв"
 MATERIAL_RETURN_TEXT = "Повернув"
 INVENTORY_TEXT = "Інвентаризація"
@@ -780,6 +783,12 @@ def main_keyboard():
     return markup
 
 
+def bot_topic_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(KeyboardButton(WHO_ON_SHIFT_TEXT), KeyboardButton(STATUS_TEXT))
+    return markup
+
+
 def events_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(QUESTION_TEXT), KeyboardButton(TASK_TEXT))
@@ -813,6 +822,16 @@ def is_events_topic(message):
         bool(EVENTS_CHAT_ID and EVENTS_THREAD_ID)
         and str(message.chat.id) == str(EVENTS_CHAT_ID)
         and str(thread_id) == str(EVENTS_THREAD_ID)
+    )
+
+
+def is_bot_topic(message):
+    """Summary actions are shown only in the configured «БОТ» topic."""
+    thread_id = getattr(message, "message_thread_id", None)
+    return (
+        bool(BOT_TOPIC_CHAT_ID and BOT_TOPIC_THREAD_ID)
+        and str(message.chat.id) == str(BOT_TOPIC_CHAT_ID)
+        and str(thread_id) == str(BOT_TOPIC_THREAD_ID)
     )
 
 
@@ -878,9 +897,87 @@ def send_with_keyboard(message, text):
         keyboard = materials_keyboard()
     elif is_events_topic(message):
         keyboard = events_keyboard()
+    elif is_bot_topic(message):
+        keyboard = bot_topic_keyboard()
     else:
         keyboard = main_keyboard()
     send_with_markup(message, text, keyboard)
+
+
+def shift_clock_text(value):
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+
+    text = str(value or "").strip()
+    match = re.search(r"(?:^|\s)(\d{1,2}:\d{2})(?::\d{2})?(?:$|\s)", text)
+    return match.group(1) if match else (text or "-")
+
+
+def get_completed_shifts_for_date(target_date):
+    """Read completed shifts without changing the existing «Зміни» worksheet."""
+    worksheet = get_sheet().worksheet("Зміни")
+    expected_date = target_date.strftime("%d.%m.%Y")
+    return [
+        row
+        for row in worksheet.get_all_records()
+        if str(get_record_value(row, {"дата"}) or "").strip() == expected_date
+    ]
+
+
+def show_who_is_on_shift(message):
+    current = now_dt()
+    active_shifts = []
+    for user in users.values():
+        shift_start = user.get("shift_start_time")
+        if not user.get("shift_started") or shift_start is None:
+            continue
+        worker = user.get("shift_worker") or {}
+        active_shifts.append({
+            "name": worker.get("name") or user.get("full_name") or "Працівник",
+            "start": shift_start,
+            "on_break": bool(user.get("break_active")),
+        })
+    active_shifts.sort(key=lambda item: item["start"])
+
+    completed_shifts = []
+    completed_error = False
+    try:
+        completed_shifts = get_completed_shifts_for_date(current.date())
+    except Exception as error:
+        completed_error = True
+        print(f"Completed shift summary failed: {error}")
+
+    lines = [f"Хто на зміні — {current.strftime('%d.%m.%Y')}", "", "🟢 Зараз працюють:"]
+    if active_shifts:
+        for item in active_shifts:
+            status = "на перерві" if item["on_break"] else "на зміні"
+            lines.append(
+                f"• {item['name']} — початок {shift_clock_text(item['start'])} ({status})"
+            )
+    else:
+        lines.append("— Нікого.")
+
+    lines.extend(["", "✅ Закрили зміну сьогодні:"])
+    if completed_error:
+        lines.append("— Не вдалося отримати дані про завершені зміни.")
+    elif completed_shifts:
+        for row in completed_shifts:
+            name = str(get_record_value(row, {"працівник"}) or "Працівник").strip()
+            start = shift_clock_text(get_record_value(row, {"початок зміни"}))
+            end = shift_clock_text(get_record_value(row, {"кінець зміни"}))
+            breaks = str(get_record_value(row, {"перерви"}) or "-").strip()
+            duration = str(
+                get_record_value(row, {"загальна тривалість"}) or "-"
+            ).strip()
+            lines.extend([
+                f"• {name}",
+                f"  Початок: {start} · Кінець: {end}",
+                f"  Перерви: {breaks} · Тривалість зміни: {duration}",
+            ])
+    else:
+        lines.append("— Ніхто.")
+
+    send_with_keyboard(message, "\n".join(lines))
 
 
 def event_noun(event_type):
@@ -3096,6 +3193,10 @@ def handle_text(message):
         return
 
     if is_events_topic(message) and handle_events_text(message, text):
+        return
+
+    if is_bot_topic(message) and text == WHO_ON_SHIFT_TEXT:
+        show_who_is_on_shift(message)
         return
 
     if text == STATUS_TEXT:
