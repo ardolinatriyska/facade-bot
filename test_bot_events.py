@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -211,14 +212,22 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(text, "Тестовий прогноз")
         self.assertNotIn("message_thread_id", options)
 
-    def test_bot_topic_keyboard_contains_only_shift_summary_and_status(self):
+    def test_bot_topic_keyboard_contains_exactly_three_buttons(self):
         self.assertEqual(
             self.module.bot_topic_keyboard().rows,
-            [["Хто на зміні", "Мій статус"]],
+            [["Хто на зміні", "Мій статус"], ["Прогноз погоди"]],
         )
         self.assertNotIn(
             "Хто на зміні",
             [button for row in self.module.main_keyboard().rows for button in row],
+        )
+        self.assertNotIn(
+            "Прогноз погоди",
+            [button for row in self.module.main_keyboard().rows for button in row],
+        )
+        self.assertNotIn(
+            "Прогноз погоди",
+            [button for row in self.module.events_keyboard().rows for button in row],
         )
 
     def test_bot_topic_status_returns_bot_topic_keyboard(self):
@@ -229,8 +238,76 @@ class BotEventsTests(unittest.TestCase):
         self.assertIn("Статус: поза зміною", self.module.bot.sent[-1][1])
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
-            [["Хто на зміні", "Мій статус"]],
+            [["Хто на зміні", "Мій статус"], ["Прогноз погоди"]],
         )
+
+    def test_bot_topic_weather_button_returns_remaining_forecast_in_same_topic(self):
+        message = self.bot_topic_message(self.module.WEATHER_FORECAST_TEXT)
+        original_forecast = self.module.get_remaining_vynnyky_weather_text
+        self.module.get_remaining_vynnyky_weather_text = lambda: "Тестовий прогноз"
+        try:
+            self.module.handle_text(message)
+        finally:
+            self.module.get_remaining_vynnyky_weather_text = original_forecast
+
+        self.assertEqual(len(self.module.bot.sent), 1)
+        chat_id, text, options = self.module.bot.sent[-1]
+        self.assertEqual(chat_id, int(self.module.BOT_TOPIC_CHAT_ID))
+        self.assertEqual(text, "Тестовий прогноз")
+        self.assertEqual(options["message_thread_id"], int(self.module.BOT_TOPIC_THREAD_ID))
+        self.assertEqual(
+            options["reply_markup"].rows,
+            [["Хто на зміні", "Мій статус"], ["Прогноз погоди"]],
+        )
+
+    def test_remaining_weather_starts_with_current_hour_and_ends_today(self):
+        fixed_now = self.module.datetime(
+            2026,
+            8,
+            25,
+            14,
+            35,
+            tzinfo=self.module.KYIV_TZ,
+        )
+        payload = {
+            "hourly": {
+                "time": [
+                    "2026-08-25T13:00",
+                    "2026-08-25T14:00",
+                    "2026-08-25T23:00",
+                    "2026-08-26T00:00",
+                ],
+                "temperature_2m": [18, 19, 12, 11],
+                "wind_speed_10m": [4, 5, 3, 2],
+                "precipitation_probability": [10, 20, 30, 40],
+            },
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        original_now_dt = self.module.now_dt
+        original_urlopen = self.module.urllib.request.urlopen
+        self.module.now_dt = lambda: fixed_now
+        self.module.urllib.request.urlopen = lambda *args, **kwargs: FakeResponse()
+        try:
+            forecast = self.module.get_remaining_vynnyky_weather_text()
+        finally:
+            self.module.now_dt = original_now_dt
+            self.module.urllib.request.urlopen = original_urlopen
+
+        self.assertNotIn("13:00", forecast)
+        self.assertIn("14:00", forecast)
+        self.assertIn("23:00", forecast)
+        self.assertNotIn("00:00", forecast)
+        self.assertNotIn("26.08", forecast)
 
     def test_who_is_on_shift_combines_active_and_today_completed_read_only(self):
         message = self.bot_topic_message(self.module.WHO_ON_SHIFT_TEXT)
@@ -294,7 +371,7 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(shifts.cell_updates, [])
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
-            [["Хто на зміні", "Мій статус"]],
+            [["Хто на зміні", "Мій статус"], ["Прогноз погоди"]],
         )
 
     def test_my_status_cancels_same_topic_delegate_and_shows_actor(self):

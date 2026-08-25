@@ -532,6 +532,7 @@ SELECT_CAPTURE_TEXT = "Обрати захватку"
 END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
 WHO_ON_SHIFT_TEXT = "Хто на зміні"
+WEATHER_FORECAST_TEXT = "Прогноз погоди"
 MATERIALS_TEXT = "Взяв"
 MATERIAL_RETURN_TEXT = "Повернув"
 INVENTORY_TEXT = "Інвентаризація"
@@ -723,6 +724,50 @@ def get_vynnyky_weather_text():
     )
 
 
+def get_remaining_vynnyky_weather_text():
+    """Return hourly weather from the current Kyiv hour through today's end."""
+    current = now_dt()
+    query = urllib.parse.urlencode({
+        "latitude": WEATHER_LATITUDE,
+        "longitude": WEATHER_LONGITUDE,
+        "hourly": "temperature_2m,wind_speed_10m,precipitation_probability",
+        "models": "ecmwf_ifs025",
+        "timezone": "Europe/Kyiv",
+        "forecast_days": 1,
+    })
+    request = urllib.request.Request(
+        f"https://api.open-meteo.com/v1/forecast?{query}",
+        headers={"User-Agent": "RAHUY-Bot/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    hourly = data.get("hourly", {})
+    today = current.date().isoformat()
+    lines = []
+    for timestamp, temperature, wind, precipitation in zip(
+        hourly.get("time", []),
+        hourly.get("temperature_2m", []),
+        hourly.get("wind_speed_10m", []),
+        hourly.get("precipitation_probability", []),
+    ):
+        if not timestamp.startswith(today):
+            continue
+        hour = int(timestamp[11:13])
+        if hour >= current.hour:
+            lines.append(
+                f"{hour:02d}:00 — {temperature:+.0f}°C | вітер {wind:.0f} км/год | опади {precipitation:.0f}%"
+            )
+
+    if not lines:
+        raise RuntimeError("Прогноз до кінця дня не отримано")
+
+    return (
+        f"Погода у Винниках до кінця дня — {current:%d.%m}:\n\n"
+        + "\n".join(lines)
+    )
+
+
 def send_weather_forecast():
     """Send the forecast to the General topic renamed to «Події»."""
     bot.send_message(
@@ -748,6 +793,16 @@ def weather_scheduler():
             except Exception as error:
                 print(f"Weather forecast failed: {error}")
         time.sleep(30)
+
+
+def show_remaining_weather_forecast(message):
+    try:
+        forecast_text = get_remaining_vynnyky_weather_text()
+    except Exception as error:
+        print(f"Manual weather forecast failed: {error}")
+        forecast_text = "Не вдалося отримати прогноз погоди. Спробуйте ще раз пізніше."
+
+    send_with_keyboard(message, forecast_text)
 
 
 def format_datetime(value):
@@ -790,6 +845,7 @@ def main_keyboard():
 def bot_topic_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(WHO_ON_SHIFT_TEXT), KeyboardButton(STATUS_TEXT))
+    markup.row(KeyboardButton(WEATHER_FORECAST_TEXT))
     return markup
 
 
@@ -3201,6 +3257,10 @@ def handle_text(message):
 
     if is_bot_topic(message) and text == WHO_ON_SHIFT_TEXT:
         show_who_is_on_shift(message)
+        return
+
+    if is_bot_topic(message) and text == WEATHER_FORECAST_TEXT:
+        show_remaining_weather_forecast(message)
         return
 
     if text == STATUS_TEXT:
