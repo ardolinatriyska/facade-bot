@@ -189,6 +189,14 @@ class BotEventsTests(unittest.TestCase):
         message.chat.id = int(self.module.BOT_TOPIC_CHAT_ID)
         return message
 
+    def materials_topic_message(self, text=""):
+        self.module.MATERIALS_CHAT_ID = "-100555000111"
+        self.module.MATERIALS_THREAD_ID = "77"
+        message = self.message(text)
+        message.message_thread_id = int(self.module.MATERIALS_THREAD_ID)
+        message.chat.id = int(self.module.MATERIALS_CHAT_ID)
+        return message
+
     def test_events_keyboard_contains_two_distinct_buttons(self):
         rows = self.module.events_keyboard().rows
         self.assertEqual(
@@ -211,6 +219,120 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(chat_id, self.module.WEATHER_CHAT_ID)
         self.assertEqual(text, "Тестовий прогноз")
         self.assertNotIn("message_thread_id", options)
+
+    def test_material_issue_selects_capture_confirms_and_saves_it(self):
+        message = self.materials_topic_message(self.module.MATERIALS_TEXT)
+        capture = {
+            "capture_id": "capture-2",
+            "name": "2 низ",
+            "project": "Well Place",
+        }
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        fixed_now = self.module.datetime(
+            2026,
+            8,
+            25,
+            10,
+            30,
+            tzinfo=self.module.KYIV_TZ,
+        )
+
+        originals = {
+            "get_active_captures": self.module.get_active_captures,
+            "get_material_catalog": self.module.get_material_catalog,
+            "find_material_candidates": self.module.find_material_candidates,
+            "interpret_material_with_ai": self.module.interpret_material_with_ai,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+            "now_dt": self.module.now_dt,
+        }
+        self.module.get_active_captures = lambda: [capture]
+        self.module.get_material_catalog = lambda: [material]
+        self.module.find_material_candidates = lambda text: [material]
+        self.module.interpret_material_with_ai = lambda text, catalog: None
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+        self.module.now_dt = lambda: fixed_now
+
+        try:
+            self.module.handle_text(message)
+            actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+            self.assertEqual(actor["pending_material"]["kind"], "issue_capture")
+            self.assertEqual(
+                self.module.bot.sent[-1][2]["reply_markup"].rows,
+                [["2 низ"], [self.module.MATERIAL_CANCEL_TEXT]],
+            )
+
+            message.text = "2 низ"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "issue_input")
+            self.assertEqual(actor["pending_material"]["capture"], capture)
+            self.assertIn(
+                "Який матеріал беремо та яка кількість?",
+                self.module.bot.sent[-1][1],
+            )
+
+            message.text = "Клей фасадний 2"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "material")
+            self.assertEqual(actor["pending_material"]["capture"], capture)
+            self.assertIn("Захватка: 2 низ", self.module.bot.sent[-1][1])
+            self.assertEqual(
+                self.module.bot.sent[-1][2]["reply_markup"].rows,
+                [[self.module.MATERIAL_CONFIRM_TEXT, self.module.MATERIAL_CANCEL_TEXT]],
+            )
+
+            message.text = self.module.MATERIAL_CONFIRM_TEXT
+            self.module.handle_text(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertEqual(len(log_sheet.appended), 1)
+        appended_values, _ = log_sheet.appended[0]
+        self.assertEqual(appended_values[5], "2 низ")
+        self.assertEqual(self.module.MATERIAL_LOG_HEADERS[5], "Захватка")
+        self.assertIn("Захватка: 2 низ", self.module.bot.sent[-1][1])
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.materials_keyboard().rows,
+        )
+
+    def test_material_issue_cancel_returns_materials_keyboard(self):
+        message = self.materials_topic_message(self.module.MATERIAL_CANCEL_TEXT)
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["pending_material"] = {
+            "kind": "issue_capture",
+            "captures": [{"name": "2 низ"}],
+        }
+
+        self.module.handle_text(message)
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertIn("скасовано", self.module.bot.sent[-1][1].lower())
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.materials_keyboard().rows,
+        )
 
     def test_bot_topic_keyboard_contains_exactly_three_buttons(self):
         self.assertEqual(

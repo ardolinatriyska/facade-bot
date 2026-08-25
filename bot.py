@@ -599,7 +599,7 @@ EVENT_FIELD_ALIASES = {
 
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
-    "захватка", "працівник", "роль", "примітка", "telegram_user_id",
+    "Захватка", "працівник", "роль", "примітка", "telegram_user_id",
     "telegram_chat_id", "timestamp",
 ]
 
@@ -1439,6 +1439,54 @@ def send_material_for_worker_prompt(message, worker, error_text=""):
     )
 
 
+def start_material_issue(message, error_text=""):
+    try:
+        captures = get_active_captures()
+    except Exception as error:
+        print(f"Material capture selection failed: {error}")
+        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
+        send_with_keyboard(message, "Не вдалося отримати список захваток. Спробуйте ще раз пізніше.")
+        return
+
+    if not captures:
+        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
+        send_with_keyboard(message, "Немає активних захваток у таблиці «Захватки».")
+        return
+
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {
+        "kind": "issue_capture",
+        "captures": captures,
+    }
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for capture in captures:
+        markup.row(KeyboardButton(capture["name"]))
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Для якої захватки беремо матеріал?",
+        markup,
+    )
+
+
+def send_material_issue_input_prompt(message, capture, error_text=""):
+    user = get_user(message.from_user.id, get_user_name(message))
+    user["pending_material"] = {
+        "kind": "issue_input",
+        "capture": capture,
+    }
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Захватка: {capture['name']}\n\n"
+        "Який матеріал беремо та яка кількість?",
+        markup,
+    )
+
+
 def choose_capture(message):
     captures = get_active_captures()
     if not captures:
@@ -1997,6 +2045,8 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
 
 def send_material_choice(message, text, forced_operation=None):
     user = get_user(message.from_user.id, get_user_name(message))
+    current_pending = user.get("pending_material") or {}
+    capture = current_pending.get("capture")
     target_worker = user.get("material_for_worker")
     quantity = extract_material_quantity(text)
     catalog = get_material_catalog()
@@ -2015,6 +2065,8 @@ def send_material_choice(message, text, forced_operation=None):
         error_text = "Не бачу кількості."
         if target_worker:
             send_material_for_worker_prompt(message, target_worker, error_text)
+        elif capture:
+            send_material_issue_input_prompt(message, capture, error_text)
         else:
             send_with_keyboard(
                 message,
@@ -2026,6 +2078,8 @@ def send_material_choice(message, text, forced_operation=None):
         error_text = "Не знайшов матеріал у довіднику. Напишіть назву точніше."
         if target_worker:
             send_material_for_worker_prompt(message, target_worker, error_text)
+        elif capture:
+            send_material_issue_input_prompt(message, capture, error_text)
         else:
             send_with_keyboard(message, error_text + " Або додамо для нього синонім.")
         return False
@@ -2037,6 +2091,7 @@ def send_material_choice(message, text, forced_operation=None):
         "candidates": candidates,
         "selected": None,
         "worker": target_worker,
+        "capture": capture,
     }
     user["material_for_worker"] = None
 
@@ -2081,6 +2136,9 @@ def select_material_candidate(message, material_name):
     worker_line = ""
     if pending.get("worker"):
         worker_line = f"\nПрацівник: {pending['worker']['name']}"
+    capture_line = ""
+    if pending.get("capture"):
+        capture_line = f"\nЗахватка: {pending['capture']['name']}"
     if pending.get("kind") == "inventory":
         markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         markup.row(KeyboardButton(INVENTORY_CONFIRM_TEXT), KeyboardButton(MATERIAL_CANCEL_TEXT))
@@ -2107,13 +2165,13 @@ def select_material_candidate(message, material_name):
             f"Майстер: {pending['worker']['name']}\n"
             f"Матеріал: {selected['Матеріал']}\n"
             f"Кількість: {pending['quantity']:g} {unit}\n"
-            f"Операція: {pending['operation']}\n\n"
+            f"Операція: {pending['operation']}{capture_line}\n\n"
             "Підтвердити запис?"
         )
     else:
         confirmation_text = (
             f"{pending['operation']}: {pending['quantity']:g} {unit}\n"
-            f"Матеріал: {selected['Матеріал']}\n\nПідтвердити запис?"
+            f"Матеріал: {selected['Матеріал']}{capture_line}\n\nПідтвердити запис?"
         )
     bot.send_message(message.chat.id, confirmation_text, **options)
     return True
@@ -2132,7 +2190,12 @@ def save_material_operation(message):
         worker.get("telegram_user_id") or message.from_user.id,
         worker.get("name") or user["full_name"],
     )
-    capture = target_user.get("selected_capture") or user.get("selected_capture") or {}
+    capture = (
+        pending.get("capture")
+        or target_user.get("selected_capture")
+        or user.get("selected_capture")
+        or {}
+    )
     spreadsheet = get_sheet()
     timestamp = now_dt()
     sync_daily_material_movement(
@@ -2161,11 +2224,12 @@ def save_material_operation(message):
     ])
 
     user["pending_material"] = None
+    capture_line = f"\nЗахватка: {capture['name']}" if capture.get("name") else ""
     send_with_keyboard(
         message,
         f"Записано: {pending['operation'].lower()} — {pending['quantity']:g} "
         f"{material.get('Од. виміру / примітка', '')}\nМатеріал: {material['Матеріал']}\n"
-        f"Працівник: {worker.get('name') or user['full_name']}",
+        f"Працівник: {worker.get('name') or user['full_name']}{capture_line}",
     )
 
 
@@ -3338,12 +3402,7 @@ def handle_materials_text(message, text):
         return
 
     if text in {MATERIALS_TEXT, "Взяти матеріал"}:
-        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
-        send_with_keyboard(
-            message,
-            "Напишіть матеріал і кількість. Наприклад: «5 кутиків» або «клей-піна 1 балон». "
-            "Запис буде оформлено як видачу.",
-        )
+        start_material_issue(message)
         return
 
     if text == MATERIAL_RETURN_TEXT:
@@ -3379,6 +3438,19 @@ def handle_materials_text(message, text):
 
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
+    if pending and pending.get("kind") == "issue_capture":
+        capture = next(
+            (item for item in pending.get("captures", []) if item.get("name") == text),
+            None,
+        )
+        if not capture:
+            start_material_issue(message, "Захватку не знайдено. Оберіть її кнопкою.")
+            return
+        send_material_issue_input_prompt(message, capture)
+        return
+    if pending and pending.get("kind") == "issue_input":
+        send_material_choice(message, text, forced_operation="Видача")
+        return
     if pending and pending.get("kind") in {"defect_input", "defect_choice"}:
         choose_defect_material(message, text, pending)
         return
