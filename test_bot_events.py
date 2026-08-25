@@ -198,6 +198,19 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
+    def test_weather_forecast_targets_general_events_without_thread_id(self):
+        original_forecast = self.module.get_vynnyky_weather_text
+        self.module.get_vynnyky_weather_text = lambda: "Тестовий прогноз"
+        try:
+            self.module.send_weather_forecast()
+        finally:
+            self.module.get_vynnyky_weather_text = original_forecast
+
+        chat_id, text, options = self.module.bot.sent[-1]
+        self.assertEqual(chat_id, self.module.WEATHER_CHAT_ID)
+        self.assertEqual(text, "Тестовий прогноз")
+        self.assertNotIn("message_thread_id", options)
+
     def test_bot_topic_keyboard_contains_only_shift_summary_and_status(self):
         self.assertEqual(
             self.module.bot_topic_keyboard().rows,

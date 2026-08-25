@@ -723,6 +723,14 @@ def get_vynnyky_weather_text():
     )
 
 
+def send_weather_forecast():
+    """Send the forecast to the General topic renamed to «Події»."""
+    bot.send_message(
+        WEATHER_CHAT_ID,
+        get_vynnyky_weather_text(),
+    )
+
+
 def weather_scheduler():
     """Send one weekday forecast at 06:00 Kyiv time while the bot is running."""
     last_sent_date = None
@@ -735,11 +743,7 @@ def weather_scheduler():
             and last_sent_date != current.date()
         ):
             try:
-                bot.send_message(
-                    WEATHER_CHAT_ID,
-                    get_vynnyky_weather_text(),
-                    message_thread_id=WEATHER_THREAD_ID,
-                )
+                send_weather_forecast()
                 last_sent_date = current.date()
             except Exception as error:
                 print(f"Weather forecast failed: {error}")
