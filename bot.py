@@ -126,9 +126,12 @@ def show_status(message):
     
 @bot.message_handler(commands=["chat_id"])
 def chat_id_command(message):
+    thread_id = getattr(message, "message_thread_id", None)
+    options = {"message_thread_id": thread_id} if thread_id is not None else {}
     bot.send_message(
         message.chat.id,
-        f"chat_id цієї групи:\n{message.chat.id}"
+        f"chat_id цієї групи:\n{message.chat.id}",
+        **options,
     )
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -137,9 +140,12 @@ SCOPES = [
 
 @bot.message_handler(commands=["my_id"])
 def my_id_command(message):
+    thread_id = getattr(message, "message_thread_id", None)
+    options = {"message_thread_id": thread_id} if thread_id is not None else {}
     bot.send_message(
         message.chat.id,
-        f"Твій user_id:\n{message.from_user.id}"
+        f"Твій user_id:\n{message.from_user.id}",
+        **options,
     )
 @bot.message_handler(commands=["thread_id"])
 def thread_id_command(message):

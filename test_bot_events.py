@@ -220,6 +220,26 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(text, "Тестовий прогноз")
         self.assertNotIn("message_thread_id", options)
 
+    def test_my_id_replies_in_the_same_topic(self):
+        message = self.message("/my_id")
+
+        self.module.my_id_command(message)
+
+        chat_id, text, options = self.module.bot.sent[-1]
+        self.assertEqual(chat_id, message.chat.id)
+        self.assertIn(str(message.from_user.id), text)
+        self.assertEqual(options["message_thread_id"], message.message_thread_id)
+
+    def test_chat_id_replies_in_the_same_topic(self):
+        message = self.message("/chat_id")
+
+        self.module.chat_id_command(message)
+
+        chat_id, text, options = self.module.bot.sent[-1]
+        self.assertEqual(chat_id, message.chat.id)
+        self.assertIn(str(message.chat.id), text)
+        self.assertEqual(options["message_thread_id"], message.message_thread_id)
+
     def test_materials_keyboard_adds_order_only_next_to_balance(self):
         self.assertEqual(
             self.module.materials_keyboard().rows,
