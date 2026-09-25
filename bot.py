@@ -38,6 +38,8 @@ EVENTS_CHAT_ID = os.getenv("EVENTS_CHAT_ID", str(WEATHER_CHAT_ID))
 EVENTS_THREAD_ID = os.getenv("EVENTS_THREAD_ID", str(WEATHER_THREAD_ID))
 BOT_TOPIC_CHAT_ID = os.getenv("BOT_TOPIC_CHAT_ID", str(WEATHER_CHAT_ID))
 BOT_TOPIC_THREAD_ID = os.getenv("BOT_TOPIC_THREAD_ID", "82")
+CALCULATIONS_CHAT_ID = os.getenv("CALCULATIONS_CHAT_ID", str(WEATHER_CHAT_ID))
+CALCULATIONS_THREAD_ID = os.getenv("CALCULATIONS_THREAD_ID")
 WEATHER_LATITUDE = 49.8157
 WEATHER_LONGITUDE = 24.1346
 
@@ -247,9 +249,12 @@ def get_or_create_objects_worksheet(spreadsheet):
         return worksheet
 
 
-def get_active_objects():
+def get_active_objects(create_if_missing=True):
     spreadsheet = get_sheet()
-    worksheet = get_or_create_objects_worksheet(spreadsheet)
+    if create_if_missing:
+        worksheet = get_or_create_objects_worksheet(spreadsheet)
+    else:
+        worksheet = spreadsheet.worksheet(OBJECTS_SHEET)
     headers = worksheet.row_values(1)
     if not any(
         normalize_sheet_header(header) in {"об'єкт", "назва", "object", "name", "project", "проєкт"}
@@ -442,6 +447,164 @@ def get_active_captures():
     return captures
 
 
+def is_active_sheet_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().upper() in {
+        "TRUE", "1", "ТАК", "YES", "ACTIVE",
+    }
+
+
+def sheet_number(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip().replace("\u00a0", "").replace(" ", "")
+    if not text:
+        return 0.0
+    text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def get_active_payment_workers():
+    worksheet = get_sheet().worksheet("Працівники")
+    workers = []
+    for row in worksheet.get_all_records():
+        name = str(get_record_value(row, {"піб", "працівник", "name"}) or "").strip()
+        active = get_record_value(row, {"active", "активний", "активна"})
+        if not name or not is_active_sheet_value(active):
+            continue
+        workers.append({
+            "telegram_user_id": str(
+                get_record_value(row, {"telegram_user_id", "telegram id", "user id", ""}) or ""
+            ).strip(),
+            "name": name,
+            "rate": sheet_number(
+                get_record_value(row, {"ставка, грн/год", "ставка грн/год", "ставка"})
+            ),
+            "initial_balance": sheet_number(
+                get_record_value(
+                    row,
+                    {"початковий баланс, грн", "початковий баланс грн", "початковий баланс"},
+                )
+            ),
+        })
+    return workers
+
+
+def get_active_captures_for_object(object_name):
+    worksheet = get_sheet().worksheet("Захватки")
+    captures = []
+    expected_object = str(object_name or "").strip().casefold()
+    for row_number, row in enumerate(worksheet.get_all_records(), start=2):
+        active = get_record_value(row, {"active", "активна", "активний"})
+        name = str(get_record_value(row, {"назва", "захватка", "name"}) or "").strip()
+        project = str(
+            get_record_value(row, {"об'єкт", "проєкт", "проект", "object", "project"}) or ""
+        ).strip()
+        if not name or not is_active_sheet_value(active):
+            continue
+        if expected_object and project.casefold() != expected_object:
+            continue
+        captures.append({
+            "capture_id": str(get_record_value(row, {"capture_id", "id"}) or "").strip(),
+            "name": name,
+            "project": project,
+            "row_number": row_number,
+        })
+    return captures
+
+
+def validate_payments_sheet(worksheet):
+    headers = worksheet.row_values(1)[:len(PAYMENT_HEADERS)]
+    if [normalize_sheet_header(value) for value in headers] != [
+        normalize_sheet_header(value) for value in PAYMENT_HEADERS
+    ]:
+        raise ValueError(
+            "Вкладка «Виплати» повинна мати колонки A:K у погодженому порядку."
+        )
+
+
+def append_payment_operation(message, operation):
+    worksheet = get_sheet().worksheet(PAYMENTS_SHEET)
+    validate_payments_sheet(worksheet)
+    amount = operation.get("amount", 0.0)
+    paid = amount if operation["type"] in {"Аванс", "Повний розрахунок"} else 0.0
+    adjustment = amount if operation["type"] == "Коригування" else 0.0
+    worksheet.append_row(
+        [
+            now_dt().strftime("%d.%m.%Y"),
+            operation["worker"]["name"],
+            paid,
+            adjustment,
+            operation.get("comment", ""),
+            operation["type"],
+            operation.get("object", {}).get("name", ""),
+            operation.get("capture", {}).get("name", ""),
+            operation.get("capture_status", "Відкрита"),
+            get_user_name(message),
+            str(message.from_user.id),
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def deactivate_capture(capture):
+    worksheet = get_sheet().worksheet("Захватки")
+    headers = worksheet.row_values(1)
+    active_column = next(
+        (
+            index
+            for index, header in enumerate(headers, start=1)
+            if normalize_sheet_header(header) in {"active", "активна", "активний"}
+        ),
+        None,
+    )
+    if active_column is None:
+        raise ValueError("У вкладці «Захватки» немає колонки active.")
+    worksheet.update_cell(capture["row_number"], active_column, False)
+
+
+def get_worker_financial_summary(worker):
+    spreadsheet = get_sheet()
+    worker_name = worker["name"]
+    daily_sheet = spreadsheet.worksheet("Денні дані")
+    total_hours = sum(
+        sheet_number(get_record_value(row, {"години", "hours"}))
+        for row in daily_sheet.get_all_records()
+        if str(get_record_value(row, {"працівник", "піб", "worker"}) or "").strip().casefold()
+        == worker_name.casefold()
+    )
+    payments_sheet = spreadsheet.worksheet(PAYMENTS_SHEET)
+    validate_payments_sheet(payments_sheet)
+    payment_rows = [
+        row
+        for row in payments_sheet.get_all_records()
+        if str(get_record_value(row, {"працівник"}) or "").strip().casefold()
+        == worker_name.casefold()
+    ]
+    paid = sum(sheet_number(get_record_value(row, {"виплачено, грн"})) for row in payment_rows)
+    adjustment = sum(
+        sheet_number(get_record_value(row, {"коригування, грн"})) for row in payment_rows
+    )
+    accrued = round(total_hours * worker.get("rate", 0.0), 2)
+    balance = round(worker.get("initial_balance", 0.0) + accrued - paid + adjustment, 2)
+    return {
+        "initial_balance": worker.get("initial_balance", 0.0),
+        "hours": round(total_hours, 2),
+        "rate": worker.get("rate", 0.0),
+        "accrued": accrued,
+        "paid": round(paid, 2),
+        "adjustment": round(adjustment, 2),
+        "balance": balance,
+        "payments": payment_rows,
+    }
+
+
 def save_shift_to_sheet(
     message,
     user,
@@ -490,17 +653,20 @@ def get_worker(user_id):
     rows = workers_sheet.get_all_records()
 
     for row in rows:
-        if str(row.get("telegram_user_id", "")).strip() == str(user_id).strip():
-            active = str(row.get("active", "")).strip().upper()
+        row_user_id = str(
+            get_record_value(row, {"telegram_user_id", "telegram id", "user id", ""}) or ""
+        ).strip()
+        if row_user_id == str(user_id).strip():
+            active = str(get_record_value(row, {"active", "активний", "активна"}) or "").strip().upper()
 
             if active != "TRUE":
                 return None
 
             return {
-                "telegram_user_id": str(row.get("telegram_user_id", "")).strip(),
-                "name": str(row.get("ПІБ", "")).strip(),
-                "role": str(row.get("роль", "")).strip(),
-                "brigade": str(row.get("бригада", "")).strip(),
+                "telegram_user_id": row_user_id,
+                "name": str(get_record_value(row, {"піб", "працівник", "name"}) or "").strip(),
+                "role": str(get_record_value(row, {"роль", "role"}) or "").strip(),
+                "brigade": str(get_record_value(row, {"бригада", "brigade"}) or "").strip(),
             }
 
     return None
@@ -512,16 +678,18 @@ def get_active_workers():
     workers = []
 
     for row in workers_sheet.get_all_records():
-        user_id = str(row.get("telegram_user_id", "")).strip()
-        name = str(row.get("ПІБ", "")).strip()
-        active = str(row.get("active", "")).strip().upper()
+        user_id = str(
+            get_record_value(row, {"telegram_user_id", "telegram id", "user id", ""}) or ""
+        ).strip()
+        name = str(get_record_value(row, {"піб", "працівник", "name"}) or "").strip()
+        active = str(get_record_value(row, {"active", "активний", "активна"}) or "").strip().upper()
         if active != "TRUE" or not user_id or not name:
             continue
         workers.append({
             "telegram_user_id": user_id,
             "name": name,
-            "role": str(row.get("роль", "")).strip(),
-            "brigade": str(row.get("бригада", "")).strip(),
+            "role": str(get_record_value(row, {"роль", "role"}) or "").strip(),
+            "brigade": str(get_record_value(row, {"бригада", "brigade"}) or "").strip(),
         })
 
     return workers
@@ -565,6 +733,23 @@ ACTIVE_TASKS_TEXT = "Актуальні завдання"
 EVENT_LIST_BACK_TEXT = "Назад до подій"
 RESOLVE_QUESTION_TEXT = "Позначити вирішеним"
 COMPLETE_TASK_TEXT = "Позначити виконаним"
+
+CALC_ADVANCE_TEXT = "💵 Видати аванс"
+CALC_FULL_PAYMENT_TEXT = "✅ Повний розрахунок"
+CALC_ADJUSTMENT_TEXT = "✏️ Коригування"
+CALC_BALANCE_TEXT = "📊 Баланс працівника"
+CALC_HISTORY_TEXT = "📜 Історія виплат"
+CALC_CLOSE_CAPTURE_TEXT = "🏁 Закрити захватку"
+CALC_CONFIRM_TEXT = "Підтвердити"
+CALC_CANCEL_TEXT = "Скасувати розрахунок"
+CALC_SKIP_COMMENT_TEXT = "Пропустити"
+
+PAYMENTS_SHEET = "Виплати"
+PAYMENT_HEADERS = [
+    "Дата", "Працівник", "Виплачено, грн", "Коригування, грн", "Коментар",
+    "Тип операції", "Об’єкт", "Захватка", "Статус захватки", "Хто вніс",
+    "Telegram ID",
+]
 
 ACTIVE_EVENT_STATUS = "Активне"
 RESOLVED_QUESTION_STATUS = "Вирішено"
@@ -872,6 +1057,14 @@ def materials_keyboard():
     return markup
 
 
+def calculations_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(KeyboardButton(CALC_ADVANCE_TEXT), KeyboardButton(CALC_FULL_PAYMENT_TEXT))
+    markup.row(KeyboardButton(CALC_ADJUSTMENT_TEXT), KeyboardButton(CALC_BALANCE_TEXT))
+    markup.row(KeyboardButton(CALC_HISTORY_TEXT), KeyboardButton(CALC_CLOSE_CAPTURE_TEXT))
+    return markup
+
+
 def is_materials_topic(message):
     """Material operations are permitted only in the configured Telegram topic."""
     thread_id = getattr(message, "message_thread_id", None)
@@ -899,6 +1092,27 @@ def is_bot_topic(message):
         bool(BOT_TOPIC_CHAT_ID and BOT_TOPIC_THREAD_ID)
         and str(message.chat.id) == str(BOT_TOPIC_CHAT_ID)
         and str(thread_id) == str(BOT_TOPIC_THREAD_ID)
+    )
+
+
+def configured_calculations_topic(message):
+    thread_id = getattr(message, "message_thread_id", None)
+    return (
+        bool(CALCULATIONS_CHAT_ID and CALCULATIONS_THREAD_ID)
+        and str(message.chat.id) == str(CALCULATIONS_CHAT_ID)
+        and str(thread_id) == str(CALCULATIONS_THREAD_ID)
+    )
+
+
+def is_calculations_topic(message):
+    if configured_calculations_topic(message):
+        return True
+    user = users.get(str(message.from_user.id), {})
+    fallback_context = user.get("calculations_context") or {}
+    chat_id, thread_id = message_context(message)
+    return (
+        str(fallback_context.get("chat_id", "")) == chat_id
+        and str(fallback_context.get("thread_id", "")) == thread_id
     )
 
 
@@ -945,6 +1159,8 @@ def get_user(user_id, full_name):
             "pending_delegate": None,
             "material_for_worker": None,
             "pending_event": None,
+            "pending_calculation": None,
+            "calculations_context": None,
         },
     )
 
@@ -960,7 +1176,9 @@ def send_with_markup(message, text, markup):
 
 
 def send_with_keyboard(message, text):
-    if is_materials_topic(message):
+    if is_calculations_topic(message):
+        keyboard = calculations_keyboard()
+    elif is_materials_topic(message):
         keyboard = materials_keyboard()
     elif is_events_topic(message):
         keyboard = events_keyboard()
@@ -3265,8 +3483,394 @@ def automatic_shift_closure_scheduler():
         time.sleep(30)
 
 
+def format_money(value):
+    return f"{float(value):,.2f}".replace(",", " ").replace(".", ",")
+
+
+def calculation_context_matches(pending, message):
+    chat_id, thread_id = message_context(message)
+    return (
+        str(pending.get("chat_id", "")) == chat_id
+        and str(pending.get("thread_id", "")) == thread_id
+    )
+
+
+def calculation_cancel_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    return markup
+
+
+def calculation_worker_button(worker):
+    if worker.get("telegram_user_id"):
+        return f"{worker['name']} | {worker['telegram_user_id']}"
+    return worker["name"]
+
+
+def find_calculation_worker(text, workers):
+    normalized = str(text or "").strip().casefold()
+    for worker in workers:
+        options = {worker["name"].casefold(), calculation_worker_button(worker).casefold()}
+        if worker.get("telegram_user_id"):
+            options.add(str(worker["telegram_user_id"]).casefold())
+        if normalized in options:
+            return worker
+    return None
+
+
+def send_calculation_worker_prompt(message, pending, error_text=""):
+    workers = pending["workers"]
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for worker in workers:
+        markup.row(KeyboardButton(calculation_worker_button(worker)))
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(message, f"{prefix}Оберіть працівника:", markup)
+
+
+def send_calculation_object_prompt(message, pending, error_text=""):
+    objects = pending["objects"]
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for item in objects:
+        markup.row(KeyboardButton(item["name"]))
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(message, f"{prefix}Оберіть активний об’єкт:", markup)
+
+
+def send_calculation_capture_prompt(message, pending, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for capture in pending["captures"]:
+        markup.row(KeyboardButton(capture["name"]))
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(
+        message,
+        f"{prefix}Об’єкт: {pending['object']['name']}\nОберіть активну захватку:",
+        markup,
+    )
+
+
+def send_calculation_amount_prompt(message, pending, error_text=""):
+    prefix = f"{error_text}\n\n" if error_text else ""
+    sign_hint = (
+        "Для коригування використовуйте знак: наприклад, +500 або -300."
+        if pending["operation_type"] == "Коригування"
+        else "Введіть додатну суму, наприклад: 2500."
+    )
+    send_with_markup(
+        message,
+        f"{prefix}Працівник: {pending['worker']['name']}\n"
+        f"Об’єкт: {pending['object']['name']}\n"
+        f"Захватка: {pending['capture']['name']}\n\n{sign_hint}",
+        calculation_cancel_keyboard(),
+    )
+
+
+def send_calculation_comment_prompt(message, pending):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(CALC_SKIP_COMMENT_TEXT))
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    send_with_markup(message, "Додайте коментар або натисніть «Пропустити»:", markup)
+
+
+def calculation_confirmation_text(pending):
+    lines = [
+        f"Операція: {pending['operation_type']}",
+        f"Працівник: {pending['worker']['name']}",
+        f"Об’єкт: {pending['object']['name']}",
+        f"Захватка: {pending['capture']['name']}",
+    ]
+    if pending["operation_type"] != "Закриття захватки":
+        lines.append(f"Сума: {format_money(pending['amount'])} грн")
+    lines.append(f"Коментар: {pending.get('comment') or '—'}")
+    return "\n".join(lines) + "\n\nПідтвердити операцію?"
+
+
+def send_calculation_confirmation(message, pending):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(CALC_CONFIRM_TEXT), KeyboardButton(CALC_CANCEL_TEXT))
+    send_with_markup(message, calculation_confirmation_text(pending), markup)
+
+
+def start_calculation_flow(message, action):
+    user = get_user(message.from_user.id, get_user_name(message))
+    chat_id, thread_id = message_context(message)
+    pending = {"action": action, "chat_id": chat_id, "thread_id": thread_id}
+
+    if action == CALC_CLOSE_CAPTURE_TEXT:
+        worker = get_worker(message.from_user.id)
+        if not worker:
+            send_with_keyboard(
+                message,
+                "Закрити захватку може зареєстрований активний працівник із Telegram ID.",
+            )
+            return
+        objects = get_active_objects(create_if_missing=False)
+        if not objects:
+            send_with_keyboard(message, "У таблиці немає активних об’єктів.")
+            return
+        pending.update({
+            "stage": "object",
+            "worker": worker,
+            "operation_type": "Закриття захватки",
+            "objects": objects,
+            "amount": 0.0,
+            "comment": "Захватку закрито через бот.",
+        })
+        user["pending_calculation"] = pending
+        send_calculation_object_prompt(message, pending)
+        return
+
+    workers = get_active_payment_workers()
+    if not workers:
+        send_with_keyboard(message, "У вкладці «Працівники» немає активних працівників.")
+        return
+    pending.update({"stage": "worker", "workers": workers})
+    if action == CALC_ADVANCE_TEXT:
+        pending["operation_type"] = "Аванс"
+    elif action == CALC_FULL_PAYMENT_TEXT:
+        pending["operation_type"] = "Повний розрахунок"
+    elif action == CALC_ADJUSTMENT_TEXT:
+        pending["operation_type"] = "Коригування"
+    user["pending_calculation"] = pending
+    send_calculation_worker_prompt(message, pending)
+
+
+def show_worker_balance(message, worker):
+    summary = get_worker_financial_summary(worker)
+    send_with_keyboard(
+        message,
+        f"Баланс працівника: {worker['name']}\n\n"
+        f"Початковий баланс: {format_money(summary['initial_balance'])} грн\n"
+        f"Відпрацьовано: {summary['hours']:g} год\n"
+        f"Ставка: {format_money(summary['rate'])} грн/год\n"
+        f"Нараховано: {format_money(summary['accrued'])} грн\n"
+        f"Виплачено: {format_money(summary['paid'])} грн\n"
+        f"Коригування: {format_money(summary['adjustment'])} грн\n"
+        f"Поточний баланс: {format_money(summary['balance'])} грн",
+    )
+
+
+def show_worker_payment_history(message, worker):
+    summary = get_worker_financial_summary(worker)
+    records = summary["payments"][-10:]
+    if not records:
+        send_with_keyboard(message, f"Для працівника {worker['name']} виплат ще немає.")
+        return
+    lines = [f"Останні операції: {worker['name']}"]
+    for row in reversed(records):
+        operation_type = str(get_record_value(row, {"тип операції"}) or "Операція").strip()
+        paid = sheet_number(get_record_value(row, {"виплачено, грн"}))
+        adjustment = sheet_number(get_record_value(row, {"коригування, грн"}))
+        amount = adjustment if operation_type == "Коригування" else paid
+        date = str(get_record_value(row, {"дата"}) or "—").strip()
+        capture = str(get_record_value(row, {"захватка"}) or "—").strip()
+        lines.append(f"• {date} | {operation_type} | {format_money(amount)} грн | {capture}")
+    send_with_keyboard(message, "\n".join(lines))
+
+
+def parse_calculation_amount(text, operation_type):
+    normalized = str(text or "").strip().replace("\u00a0", "").replace(" ", "")
+    normalized = normalized.replace("грн", "").replace("₴", "").replace(",", ".")
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d{1,2})?", normalized):
+        raise ValueError("Введіть суму числом, не більше двох знаків після коми.")
+    amount = float(normalized)
+    if operation_type == "Коригування":
+        if amount == 0:
+            raise ValueError("Коригування не може дорівнювати нулю.")
+    elif amount <= 0:
+        raise ValueError("Сума повинна бути більшою за нуль.")
+    return amount
+
+
+def handle_calculations_text(message, text):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_calculation") or {}
+    if pending and not calculation_context_matches(pending, message):
+        pending = {}
+
+    if text == CALC_CANCEL_TEXT:
+        if pending:
+            user["pending_calculation"] = None
+            send_with_keyboard(message, "Операцію скасовано.")
+        else:
+            send_with_keyboard(message, "Активної операції немає.")
+        return True
+
+    actions = {
+        CALC_ADVANCE_TEXT,
+        CALC_FULL_PAYMENT_TEXT,
+        CALC_ADJUSTMENT_TEXT,
+        CALC_BALANCE_TEXT,
+        CALC_HISTORY_TEXT,
+        CALC_CLOSE_CAPTURE_TEXT,
+    }
+    if text in actions:
+        try:
+            start_calculation_flow(message, text)
+        except Exception as error:
+            print(f"Calculation flow start failed: {error}")
+            send_with_keyboard(message, f"Не вдалося почати операцію. {error}")
+        return True
+
+    if not pending:
+        send_with_keyboard(message, "Оберіть дію в меню «Розрахунки».")
+        return True
+
+    if pending["stage"] == "worker":
+        worker = find_calculation_worker(text, pending["workers"])
+        if not worker:
+            send_calculation_worker_prompt(message, pending, "Працівника не знайдено.")
+            return True
+        pending["worker"] = worker
+        if pending["action"] == CALC_BALANCE_TEXT:
+            user["pending_calculation"] = None
+            try:
+                show_worker_balance(message, worker)
+            except Exception as error:
+                print(f"Worker balance failed: {error}")
+                send_with_keyboard(message, f"Не вдалося розрахувати баланс. {error}")
+            return True
+        if pending["action"] == CALC_HISTORY_TEXT:
+            user["pending_calculation"] = None
+            try:
+                show_worker_payment_history(message, worker)
+            except Exception as error:
+                print(f"Worker payment history failed: {error}")
+                send_with_keyboard(message, f"Не вдалося отримати історію. {error}")
+            return True
+        objects = get_active_objects(create_if_missing=False)
+        if not objects:
+            user["pending_calculation"] = None
+            send_with_keyboard(message, "У таблиці немає активних об’єктів.")
+            return True
+        pending.update({"stage": "object", "objects": objects})
+        send_calculation_object_prompt(message, pending)
+        return True
+
+    if pending["stage"] == "object":
+        selected = next(
+            (item for item in pending["objects"] if item["name"].casefold() == text.casefold()),
+            None,
+        )
+        if not selected:
+            send_calculation_object_prompt(message, pending, "Об’єкт не знайдено.")
+            return True
+        captures = get_active_captures_for_object(selected["name"])
+        if not captures:
+            send_calculation_object_prompt(
+                message,
+                pending,
+                f"Для об’єкта «{selected['name']}» немає активних захваток.",
+            )
+            return True
+        pending.update({"stage": "capture", "object": selected, "captures": captures})
+        send_calculation_capture_prompt(message, pending)
+        return True
+
+    if pending["stage"] == "capture":
+        capture = next(
+            (item for item in pending["captures"] if item["name"].casefold() == text.casefold()),
+            None,
+        )
+        if not capture:
+            send_calculation_capture_prompt(message, pending, "Захватку не знайдено.")
+            return True
+        pending["capture"] = capture
+        if pending["operation_type"] == "Закриття захватки":
+            pending["stage"] = "confirm"
+            send_calculation_confirmation(message, pending)
+        else:
+            pending["stage"] = "amount"
+            send_calculation_amount_prompt(message, pending)
+        return True
+
+    if pending["stage"] == "amount":
+        try:
+            pending["amount"] = parse_calculation_amount(text, pending["operation_type"])
+        except ValueError as error:
+            send_calculation_amount_prompt(message, pending, str(error))
+            return True
+        pending["stage"] = "comment"
+        send_calculation_comment_prompt(message, pending)
+        return True
+
+    if pending["stage"] == "comment":
+        pending["comment"] = "" if text == CALC_SKIP_COMMENT_TEXT else text
+        pending["stage"] = "confirm"
+        send_calculation_confirmation(message, pending)
+        return True
+
+    if pending["stage"] == "confirm":
+        if text != CALC_CONFIRM_TEXT:
+            send_calculation_confirmation(message, pending)
+            return True
+        try:
+            operation = {
+                "worker": pending["worker"],
+                "amount": pending.get("amount", 0.0),
+                "comment": pending.get("comment", ""),
+                "type": pending["operation_type"],
+                "object": pending["object"],
+                "capture": pending["capture"],
+                "capture_status": (
+                    "Закрита"
+                    if pending["operation_type"] == "Закриття захватки"
+                    else "Відкрита"
+                ),
+            }
+            if pending["operation_type"] == "Закриття захватки":
+                if not pending.get("payment_saved"):
+                    append_payment_operation(message, operation)
+                    pending["payment_saved"] = True
+                deactivate_capture(pending["capture"])
+            else:
+                append_payment_operation(message, operation)
+        except Exception as error:
+            print(f"Calculation operation saving failed: {error}")
+            send_with_markup(
+                message,
+                f"Не вдалося записати операцію. {error}",
+                calculation_cancel_keyboard(),
+            )
+            return True
+        user["pending_calculation"] = None
+        amount_line = (
+            ""
+            if pending["operation_type"] == "Закриття захватки"
+            else f"\nСума: {format_money(pending['amount'])} грн"
+        )
+        send_with_keyboard(
+            message,
+            f"Записано: {pending['operation_type']}\n"
+            f"Працівник: {pending['worker']['name']}\n"
+            f"Об’єкт: {pending['object']['name']}\n"
+            f"Захватка: {pending['capture']['name']}{amount_line}",
+        )
+        return True
+
+    return True
+
+
+@bot.message_handler(commands=["calculations", "rozrahunky"])
+def calculations_command(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    chat_id, thread_id = message_context(message)
+    user["calculations_context"] = {"chat_id": chat_id, "thread_id": thread_id}
+    user["pending_calculation"] = None
+    send_with_markup(
+        message,
+        "Меню «Розрахунки» активовано в цій гілці.",
+        calculations_keyboard(),
+    )
+
+
 @bot.message_handler(commands=["start"])
 def start_command(message):
+    if is_calculations_topic(message):
+        send_with_keyboard(message, "Ви у гілці «Розрахунки». Оберіть потрібну дію.")
+        return
     if is_materials_topic(message):
         send_with_keyboard(
             message,
@@ -3350,6 +3954,14 @@ def handle_photo(message):
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     text = (message.text or "").strip()
+
+    if is_calculations_topic(message):
+        try:
+            handle_calculations_text(message, text)
+        except Exception as error:
+            print(f"Calculation handler failed: {error}")
+            send_with_keyboard(message, f"Не вдалося виконати операцію. {error}")
+        return
 
     if is_materials_topic(message):
         handle_materials_text(message, text)

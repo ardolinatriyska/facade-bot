@@ -197,6 +197,74 @@ class BotEventsTests(unittest.TestCase):
         message.chat.id = int(self.module.MATERIALS_CHAT_ID)
         return message
 
+    def calculations_topic_message(self, text=""):
+        self.module.CALCULATIONS_CHAT_ID = "-100555000111"
+        self.module.CALCULATIONS_THREAD_ID = "88"
+        message = self.message(text)
+        message.message_thread_id = int(self.module.CALCULATIONS_THREAD_ID)
+        message.chat.id = int(self.module.CALCULATIONS_CHAT_ID)
+        return message
+
+    def calculation_sheets(self, payment_records=None, daily_records=None):
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=[
+                "telegram_user_id", "ПІБ", "роль", "бригада", "active", "примітка",
+                "ставка, грн/год", "початковий баланс, грн",
+            ],
+            records=[{
+                "telegram_user_id": "123",
+                "ПІБ": "Іван Петренко",
+                "роль": "Бригадир",
+                "бригада": "Резуненко",
+                "active": "TRUE",
+                "ставка, грн/год": 200,
+                "початковий баланс, грн": -300,
+            }, {
+                "telegram_user_id": "5101350452",
+                "ПІБ": "Коваль Роман",
+                "роль": "Майстер",
+                "бригада": "Резуненко",
+                "active": "TRUE",
+                "ставка, грн/год": 250,
+                "початковий баланс, грн": 100,
+            }],
+        )
+        objects = FakeWorksheet(
+            "Об’єкти",
+            headers=["об’єкт", "active"],
+            records=[{"об’єкт": "Well Place", "active": "TRUE"}],
+        )
+        captures = FakeWorksheet(
+            "Захватки",
+            headers=["capture_id", "назва", "обʼєкт", "active", "примітка"],
+            records=[
+                {
+                    "capture_id": "capture-2",
+                    "назва": "2 низ",
+                    "обʼєкт": "Well Place",
+                    "active": "TRUE",
+                },
+                {
+                    "capture_id": "other",
+                    "назва": "Інший об’єкт",
+                    "обʼєкт": "Кротошин",
+                    "active": "TRUE",
+                },
+            ],
+        )
+        payments = FakeWorksheet(
+            "Виплати",
+            headers=list(self.module.PAYMENT_HEADERS),
+            records=list(payment_records or []),
+        )
+        daily = FakeWorksheet(
+            "Денні дані",
+            headers=["Дата", "Працівник", "Роль", "Години"],
+            records=list(daily_records or []),
+        )
+        return FakeSpreadsheet([workers, objects, captures, payments, daily])
+
     def test_events_keyboard_contains_two_distinct_buttons(self):
         rows = self.module.events_keyboard().rows
         self.assertEqual(
@@ -1217,6 +1285,182 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(title, "Події")
         self.assertEqual(len(events.appended), 1)
         self.assertEqual(questions.appended, [])
+
+    def test_calculations_keyboard_contains_requested_actions(self):
+        self.assertEqual(
+            self.module.calculations_keyboard().rows,
+            [
+                [self.module.CALC_ADVANCE_TEXT, self.module.CALC_FULL_PAYMENT_TEXT],
+                [self.module.CALC_ADJUSTMENT_TEXT, self.module.CALC_BALANCE_TEXT],
+                [self.module.CALC_HISTORY_TEXT, self.module.CALC_CLOSE_CAPTURE_TEXT],
+            ],
+        )
+
+    def test_worker_lookup_supports_live_blank_telegram_id_header(self):
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=["", "ПІБ", "роль", "бригада", "active"],
+            records=[{
+                "": "123",
+                "ПІБ": "Іван Петренко",
+                "роль": "Бригадир",
+                "бригада": "Резуненко",
+                "active": "TRUE",
+            }],
+        )
+        self.module.get_sheet = lambda: FakeSpreadsheet([workers])
+
+        worker = self.module.get_worker(123)
+
+        self.assertEqual(worker["telegram_user_id"], "123")
+        self.assertEqual(worker["name"], "Іван Петренко")
+
+    def test_calculations_command_activates_current_topic_without_env(self):
+        self.module.CALCULATIONS_THREAD_ID = None
+        message = self.message("/calculations")
+
+        self.module.calculations_command(message)
+
+        self.assertTrue(self.module.is_calculations_topic(message))
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.calculations_keyboard().rows,
+        )
+
+    def test_advance_flow_filters_captures_and_appends_exact_payment_row(self):
+        spreadsheet = self.calculation_sheets()
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message()
+
+        for text in (
+            self.module.CALC_ADVANCE_TEXT,
+            "Коваль Роман | 5101350452",
+            "Well Place",
+        ):
+            self.assertTrue(self.module.handle_calculations_text(message, text))
+
+        pending = self.module.get_user(123, "Іван Петренко")["pending_calculation"]
+        self.assertEqual([item["name"] for item in pending["captures"]], ["2 низ"])
+
+        for text in ("2 низ", "2500,50", self.module.CALC_SKIP_COMMENT_TEXT, self.module.CALC_CONFIRM_TEXT):
+            self.assertTrue(self.module.handle_calculations_text(message, text))
+
+        row, options = spreadsheet.sheets["Виплати"].appended[0]
+        self.assertEqual(options, {"value_input_option": "USER_ENTERED"})
+        self.assertEqual(row[1:], [
+            "Коваль Роман", 2500.5, 0.0, "", "Аванс", "Well Place", "2 низ",
+            "Відкрита", "Іван Петренко", "123",
+        ])
+        self.assertEqual(spreadsheet.created, [])
+
+    def test_signed_adjustment_is_written_only_to_adjustment_column(self):
+        spreadsheet = self.calculation_sheets()
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message()
+        for text in (
+            self.module.CALC_ADJUSTMENT_TEXT,
+            "Коваль Роман | 5101350452",
+            "Well Place",
+            "2 низ",
+            "-300",
+            "Утримання за інструмент",
+            self.module.CALC_CONFIRM_TEXT,
+        ):
+            self.assertTrue(self.module.handle_calculations_text(message, text))
+
+        row, _ = spreadsheet.sheets["Виплати"].appended[0]
+        self.assertEqual(row[2], 0.0)
+        self.assertEqual(row[3], -300.0)
+        self.assertEqual(row[4], "Утримання за інструмент")
+        self.assertEqual(row[5], "Коригування")
+
+    def test_full_payment_button_routes_through_calculations_topic(self):
+        spreadsheet = self.calculation_sheets()
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message(self.module.CALC_FULL_PAYMENT_TEXT)
+
+        self.module.handle_text(message)
+
+        pending = self.module.get_user(123, "Іван Петренко")["pending_calculation"]
+        self.assertEqual(pending["operation_type"], "Повний розрахунок")
+        self.assertEqual(pending["stage"], "worker")
+        self.assertIn("Оберіть працівника", self.module.bot.sent[-1][1])
+
+    def test_balance_matches_sheet_formula(self):
+        spreadsheet = self.calculation_sheets(
+            payment_records=[
+                {
+                    "Дата": "20.09.2026",
+                    "Працівник": "Коваль Роман",
+                    "Виплачено, грн": 500,
+                    "Коригування, грн": 0,
+                },
+                {
+                    "Дата": "21.09.2026",
+                    "Працівник": "Коваль Роман",
+                    "Виплачено, грн": 0,
+                    "Коригування, грн": -100,
+                },
+            ],
+            daily_records=[
+                {"Дата": "20.09.2026", "Працівник": "Коваль Роман", "Години": 8},
+                {"Дата": "21.09.2026", "Працівник": "Коваль Роман", "Години": 4},
+            ],
+        )
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message()
+
+        self.module.handle_calculations_text(message, self.module.CALC_BALANCE_TEXT)
+        self.module.handle_calculations_text(message, "Коваль Роман | 5101350452")
+
+        response = self.module.bot.sent[-1][1]
+        self.assertIn("Нараховано: 3 000,00 грн", response)
+        self.assertIn("Виплачено: 500,00 грн", response)
+        self.assertIn("Коригування: -100,00 грн", response)
+        self.assertIn("Поточний баланс: 2 500,00 грн", response)
+
+    def test_history_shows_latest_payment_first(self):
+        spreadsheet = self.calculation_sheets(payment_records=[
+            {
+                "Дата": "20.09.2026", "Працівник": "Коваль Роман",
+                "Виплачено, грн": 500, "Коригування, грн": 0,
+                "Тип операції": "Аванс", "Захватка": "2 низ",
+            },
+            {
+                "Дата": "21.09.2026", "Працівник": "Коваль Роман",
+                "Виплачено, грн": 0, "Коригування, грн": 150,
+                "Тип операції": "Коригування", "Захватка": "2 низ",
+            },
+        ])
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message()
+
+        self.module.handle_calculations_text(message, self.module.CALC_HISTORY_TEXT)
+        self.module.handle_calculations_text(message, "Коваль Роман | 5101350452")
+
+        response = self.module.bot.sent[-1][1]
+        self.assertLess(response.index("21.09.2026"), response.index("20.09.2026"))
+        self.assertIn("Коригування | 150,00 грн", response)
+
+    def test_close_capture_appends_zero_operation_and_deactivates_capture(self):
+        spreadsheet = self.calculation_sheets()
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.calculations_topic_message()
+        for text in (
+            self.module.CALC_CLOSE_CAPTURE_TEXT,
+            "Well Place",
+            "2 низ",
+            self.module.CALC_CONFIRM_TEXT,
+        ):
+            self.assertTrue(self.module.handle_calculations_text(message, text))
+
+        row, _ = spreadsheet.sheets["Виплати"].appended[0]
+        self.assertEqual(row[1], "Іван Петренко")
+        self.assertEqual(row[2:4], [0.0, 0.0])
+        self.assertEqual(row[5], "Закриття захватки")
+        self.assertEqual(row[8], "Закрита")
+        self.assertEqual(spreadsheet.sheets["Захватки"].cell_updates, [(2, 4, False)])
+        self.assertEqual(self.module.get_active_captures_for_object("Well Place"), [])
 
 
 if __name__ == "__main__":
