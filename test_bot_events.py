@@ -12,8 +12,10 @@ class FakeWorksheetNotFound(Exception):
 
 
 class FakeButton:
-    def __init__(self, text):
+    def __init__(self, text, callback_data=None, url=None):
         self.text = text
+        self.callback_data = callback_data
+        self.url = url
 
 
 class FakeMarkup:
@@ -29,6 +31,9 @@ class FakeTeleBot:
     def __init__(self, token, **kwargs):
         self.token = token
         self.sent = []
+        self.edited = []
+        self.answered_callbacks = []
+        self.next_message_id = 1000
 
     def get_me(self):
         return types.SimpleNamespace(username="test_bot", id=99)
@@ -36,8 +41,19 @@ class FakeTeleBot:
     def message_handler(self, **kwargs):
         return lambda function: function
 
+    def callback_query_handler(self, **kwargs):
+        return lambda function: function
+
     def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text, kwargs))
+        self.next_message_id += 1
+        return types.SimpleNamespace(message_id=self.next_message_id)
+
+    def edit_message_text(self, text, **kwargs):
+        self.edited.append((text, kwargs))
+
+    def answer_callback_query(self, callback_query_id, text=None, **kwargs):
+        self.answered_callbacks.append((callback_query_id, text, kwargs))
 
     def infinity_polling(self, **kwargs):
         return None
@@ -51,6 +67,8 @@ def load_bot_module():
     telebot_types = types.ModuleType("telebot.types")
     telebot_types.KeyboardButton = FakeButton
     telebot_types.ReplyKeyboardMarkup = FakeMarkup
+    telebot_types.InlineKeyboardButton = FakeButton
+    telebot_types.InlineKeyboardMarkup = FakeMarkup
     telebot_module.types = telebot_types
 
     gspread_module = types.ModuleType("gspread")
@@ -111,6 +129,7 @@ class FakeWorksheet:
         self.updated = []
         self.appended = []
         self.cell_updates = []
+        self.col_count = len(self.headers)
 
     def row_values(self, row):
         return list(self.headers) if row == 1 else []
@@ -128,6 +147,10 @@ class FakeWorksheet:
         self.updated.append((cell, values))
         self.headers = list(values[0])
         self.records = [dict(zip(self.headers, row)) for row in values[1:]]
+        self.col_count = max(self.col_count, len(self.headers))
+
+    def add_cols(self, count):
+        self.col_count += count
 
     def append_row(self, values, **kwargs):
         self.appended.append((list(values), kwargs))
@@ -167,6 +190,8 @@ class BotEventsTests(unittest.TestCase):
     def setUp(self):
         self.module.users.clear()
         self.module.bot.sent.clear()
+        self.module.bot.edited.clear()
+        self.module.bot.answered_callbacks.clear()
 
     def message(self, text=""):
         return types.SimpleNamespace(
@@ -265,15 +290,402 @@ class BotEventsTests(unittest.TestCase):
         )
         return FakeSpreadsheet([workers, objects, captures, payments, daily])
 
-    def test_events_keyboard_contains_two_distinct_buttons(self):
+    def callback(self, message, data):
+        callback_message = types.SimpleNamespace(
+            message_id=1001,
+            message_thread_id=message.message_thread_id,
+            chat=message.chat,
+            text="",
+        )
+        return types.SimpleNamespace(
+            id=f"callback-{data}",
+            data=data,
+            from_user=message.from_user,
+            message=callback_message,
+        )
+
+    def active_shift_user(self, message, capture=None):
+        capture = capture or {
+            "capture_id": "capture-2",
+            "name": "2 секція",
+            "project": "Well Place 2",
+        }
+        user = self.module.get_user(message.from_user.id, "Іван Петренко")
+        user.update({
+            "shift_started": True,
+            "shift_start_time": self.module.datetime(
+                2026, 9, 26, 8, 0, tzinfo=self.module.KYIV_TZ
+            ),
+            "shift_capture": dict(capture),
+            "selected_capture": dict(capture),
+            "shift_id": "shift-test-123",
+            "shift_worker": {
+                "telegram_user_id": "123",
+                "name": "Іван Петренко",
+                "role": "Майстер",
+                "brigade": "Резуненко",
+            },
+        })
+        return user
+
+    def goal_sheet(self, records=None):
+        return FakeWorksheet(
+            self.module.SHIFT_GOALS_SHEET,
+            headers=list(self.module.SHIFT_GOAL_HEADERS),
+            records=list(records or []),
+        )
+
+    def advance_personal_goal_to_quantity(self, message, process_index=1, category_index=1, subprocess_index=1):
+        self.module.start_shift_goal(message)
+        self.module.handle_goal_callback(self.callback(message, "g:type:personal"))
+        self.module.handle_goal_callback(
+            self.callback(message, f"g:process:{process_index}")
+        )
+        if list(self.module.GOAL_PROCESS_TREE)[process_index] != "🧱 Клінкер":
+            self.module.handle_goal_callback(
+                self.callback(message, f"g:category:{category_index}")
+            )
+        self.module.handle_goal_callback(
+            self.callback(message, f"g:subprocess:{subprocess_index}")
+        )
+
+    def test_events_keyboard_contains_only_approved_operational_buttons(self):
         rows = self.module.events_keyboard().rows
         self.assertEqual(
             rows,
             [
-                ["Питання", "Завдання"],
-                ["Актуальні питання", "Актуальні завдання"],
+                ["🎯 Ціль зміни", "📊 Мій статус"],
+                ["📍 Обрати захватку", "🌦 Прогноз погоди"],
             ],
         )
+
+    def test_events_menu_does_not_move_time_controls_from_work_menu(self):
+        event_buttons = [button for row in self.module.events_keyboard().rows for button in row]
+        work_buttons = [button for row in self.module.main_keyboard().rows for button in row]
+        for button in (
+            self.module.START_SHIFT_TEXT,
+            self.module.START_BREAK_TEXT,
+            self.module.STOP_BREAK_TEXT,
+            self.module.END_SHIFT_TEXT,
+        ):
+            self.assertNotIn(button, event_buttons)
+            self.assertIn(button, work_buttons)
+
+    def test_all_four_events_buttons_route_in_events_topic(self):
+        message = self.message()
+        user = self.active_shift_user(message)
+        calls = []
+        original_choose = self.module.choose_capture
+        original_weather = self.module.show_remaining_weather_forecast
+        original_status = self.module.show_status
+        self.module.choose_capture = lambda current: calls.append("capture")
+        self.module.show_remaining_weather_forecast = lambda current: calls.append("weather")
+        self.module.show_status = lambda current: calls.append("status")
+        try:
+            for text in (
+                self.module.EVENTS_STATUS_TEXT,
+                self.module.EVENTS_CAPTURE_TEXT,
+                self.module.EVENTS_WEATHER_TEXT,
+            ):
+                self.assertTrue(self.module.handle_events_text(message, text))
+            self.assertTrue(
+                self.module.handle_events_text(message, self.module.SHIFT_GOAL_TEXT)
+            )
+        finally:
+            self.module.choose_capture = original_choose
+            self.module.show_remaining_weather_forecast = original_weather
+            self.module.show_status = original_status
+
+        self.assertEqual(calls, ["status", "capture", "weather"])
+        self.assertEqual(user["pending_goal"]["stage"], "type")
+
+    def test_goal_requires_active_shift_and_reuses_capture_selector_when_missing(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        self.module.start_shift_goal(message)
+        self.assertIn("Спочатку відкрийте зміну", self.module.bot.sent[-1][1])
+
+        user = self.module.get_user(message.from_user.id, "Іван Петренко")
+        user.update({
+            "shift_started": True,
+            "shift_start_time": self.module.datetime(
+                2026, 9, 26, 8, 0, tzinfo=self.module.KYIV_TZ
+            ),
+        })
+        calls = []
+        original_choose = self.module.choose_capture
+        self.module.choose_capture = lambda current: calls.append(current)
+        try:
+            self.module.start_shift_goal(message)
+        finally:
+            self.module.choose_capture = original_choose
+        self.assertEqual(calls, [message])
+        self.assertEqual(user["pending_goal"]["stage"], "waiting_capture")
+
+    def test_goal_navigation_exact_labels_units_numeric_and_back(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        self.active_shift_user(message)
+        self.module.start_shift_goal(message)
+        self.assertEqual(self.module.bot.sent[-1][2]["reply_markup"].rows, [
+            [self.module.GOAL_PERSONAL_TEXT, self.module.GOAL_TEAM_TEXT],
+            [self.module.GOAL_BACK_TEXT],
+        ])
+
+        self.module.handle_goal_callback(self.callback(message, "g:type:personal"))
+        pending = self.module.get_user(123, "Іван Петренко")["pending_goal"]
+        self.assertEqual(pending["stage"], "process")
+        self.module.handle_goal_callback(self.callback(message, "g:process:1"))
+        self.module.handle_goal_callback(self.callback(message, "g:category:1"))
+        rows = self.module.bot.edited[-1][1]["reply_markup"].rows
+        labels = [button for row in rows for button in row]
+        self.assertIn("Попереднє вирівнювання площини", labels)
+        self.assertIn("Молочко", labels)
+        self.assertNotIn("Додатковий декоративний шар", labels)
+
+        self.module.handle_goal_callback(self.callback(message, "g:back"))
+        self.assertEqual(pending["stage"], "category")
+        self.module.handle_goal_callback(self.callback(message, "g:category:1"))
+        self.module.handle_goal_callback(self.callback(message, "g:subprocess:2"))
+        self.assertEqual(pending["subprocess"], "Молочко")
+        self.assertEqual(pending["unit"], "м²")
+        self.assertTrue(self.module.handle_goal_text(message, "12,5"))
+        self.assertEqual(pending["target"], 12.5)
+        self.assertEqual(pending["stage"], "confirm")
+
+        pending["stage"] = "quantity"
+        self.assertTrue(self.module.handle_goal_text(message, "0"))
+        self.assertEqual(pending["stage"], "quantity")
+        self.assertIn("більшим за нуль", self.module.bot.edited[-1][0])
+        self.assertEqual(len(self.module.bot.sent), 1)
+
+    def test_goal_process_tree_matches_approved_labels_and_units(self):
+        self.assertEqual(self.module.GOAL_PROCESS_TREE, {
+            "🧱 Поклейка": {
+                "Підготовка": [
+                    ("Підготовка основи", "м²"),
+                    ("Захист вікон", "шт."),
+                    ("Люлька / риштування", "секції"),
+                    ("Виставлення жилок", "м.п."),
+                    ("Стартовий / цокольний профіль", "м.п."),
+                    ("Деформаційний профіль / шов", "м.п."),
+                ],
+                "Утеплювач": [
+                    ("Примикаюча віконна планка", "м.п."),
+                    ("Поклейка утеплювача", "м²"),
+                    ("Запінення щілин", "м²"),
+                    ("Затирання площі", "м²"),
+                    ("Дюбелювання", "м²"),
+                ],
+            },
+            "🕸 Сітка": {
+                "Підготовка під перетяжку": [
+                    ("Запінення відкосів", "м.п."),
+                    ("Встановлення кутиків", "м.п."),
+                    ("Встановлення крапельників", "м.п."),
+                    ("Діагональні косинки", "шт."),
+                    ("Герметизація примикань", "м.п."),
+                    ("Встановлення відливів", "м.п."),
+                    ("Перетяжка відкосів", "м.п."),
+                ],
+                "Площина": [
+                    ("Попереднє вирівнювання площини", "м²"),
+                    ("Перетяжка сіткою", "м²"),
+                    ("Молочко", "м²"),
+                    ("Корекція площі", "м²"),
+                ],
+            },
+            "🎨 Декор": {
+                "Баранник": [
+                    ("Ґрунтування", "м²"),
+                    ("Нанесення баранника", "м²"),
+                    ("Фарбування", "м²"),
+                    ("Миття вікон", "шт."),
+                ],
+            },
+            "🧱 Клінкер": {
+                "": [
+                    ("Розмітка площі", "м²"),
+                    ("Приклеювання листів", "м²"),
+                    ("Фугування", "м²"),
+                    ("Обробка гідрофобом", "м²"),
+                ],
+            },
+        })
+
+    def test_multiple_personal_goals_are_saved_for_one_shift(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        self.active_shift_user(message)
+        goal_sheet = self.goal_sheet()
+        spreadsheet = FakeSpreadsheet([goal_sheet])
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            self.advance_personal_goal_to_quantity(message)
+            self.module.handle_goal_text(message, "25")
+            self.module.handle_goal_callback(self.callback(message, "g:add"))
+            pending = self.module.get_user(123, "Іван Петренко")["pending_goal"]
+            self.assertEqual(pending["stage"], "process")
+
+            self.module.handle_goal_callback(self.callback(message, "g:process:3"))
+            self.module.handle_goal_callback(self.callback(message, "g:subprocess:0"))
+            self.module.handle_goal_text(message, "18,5")
+            self.module.handle_goal_callback(self.callback(message, "g:done"))
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(len(goal_sheet.appended), 2)
+        first, second = [values for values, _ in goal_sheet.appended]
+        self.assertEqual(first[1], "shift-test-123")
+        self.assertEqual(first[16:19], ["Перетяжка сіткою", "м²", 25.0])
+        self.assertEqual(second[16:19], ["Розмітка площі", "м²", 18.5])
+        self.assertIsNone(self.module.get_user(123, "Іван Петренко")["pending_goal"])
+
+    def test_team_goal_saves_one_shared_row_without_duplicates(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        self.active_shift_user(message)
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=["telegram_user_id", "ПІБ", "роль", "бригада", "active"],
+            records=[
+                {
+                    "telegram_user_id": "123", "ПІБ": "Іван Петренко",
+                    "роль": "Майстер", "бригада": "Резуненко", "active": "TRUE",
+                },
+                {
+                    "telegram_user_id": "456", "ПІБ": "Роман Коваль",
+                    "роль": "Майстер", "бригада": "Резуненко", "active": "TRUE",
+                },
+            ],
+        )
+        goal_sheet = self.goal_sheet()
+        spreadsheet = FakeSpreadsheet([workers, goal_sheet])
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            self.module.start_shift_goal(message)
+            self.module.handle_goal_callback(self.callback(message, "g:type:team"))
+            self.module.handle_goal_callback(self.callback(message, "g:team:1"))
+            self.module.handle_goal_callback(self.callback(message, "g:team:done"))
+            self.module.handle_goal_callback(self.callback(message, "g:process:2"))
+            self.module.handle_goal_callback(self.callback(message, "g:category:0"))
+            self.module.handle_goal_callback(self.callback(message, "g:subprocess:1"))
+            self.module.handle_goal_text(message, "40")
+            self.module.handle_goal_callback(self.callback(message, "g:done"))
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(len(goal_sheet.appended), 1)
+        row, _ = goal_sheet.appended[0]
+        self.assertEqual(row[7], "Командна")
+        self.assertEqual(set(row[10].split(";")), {"123", "456"})
+        self.assertEqual(row[12], "123")
+        self.assertEqual(row[16:19], ["Нанесення баранника", "м²", 40.0])
+
+    def test_my_status_shows_capture_shared_progress_without_double_counting(self):
+        message = self.message(self.module.EVENTS_STATUS_TEXT)
+        self.active_shift_user(message)
+        fixed_now = self.module.datetime(2026, 9, 26, 12, 0, tzinfo=self.module.KYIV_TZ)
+        record = dict(zip(self.module.SHIFT_GOAL_HEADERS, [
+            "goal-1", "shift-test-123", "26.09.2026", "26.09.2026 08:00:00",
+            "capture-2", "2 секція", "Well Place 2", "Командна", "123",
+            "Іван Петренко", "123;456", "Іван Петренко; Роман Коваль", "123",
+            "Іван Петренко", "🕸 Сітка", "Площина", "Перетяжка сіткою", "м²",
+            100, 60, 60, "Частково", "", "",
+        ]))
+        spreadsheet = FakeSpreadsheet([self.goal_sheet([record])])
+        original_get_sheet = self.module.get_sheet
+        original_now = self.module.now_dt
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.now_dt = lambda: fixed_now
+        try:
+            self.module.show_status(message)
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.now_dt = original_now
+
+        response = self.module.bot.sent[-1][1]
+        self.assertIn("Захватка: 2 секція", response)
+        self.assertEqual(response.count("Перетяжка сіткою"), 1)
+        self.assertIn("██████░░░░ 60%", response)
+        self.assertIn("Командна · У процесі", response)
+
+    def test_close_shift_skips_goal_fact_when_none_and_always_asks_cleanup(self):
+        message = self.message(self.module.END_SHIFT_TEXT)
+        user = self.active_shift_user(message)
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=["telegram_user_id", "ПІБ", "роль", "бригада", "active"],
+            records=[{
+                "telegram_user_id": "123", "ПІБ": "Іван Петренко", "роль": "Майстер",
+                "бригада": "Резуненко", "active": "TRUE",
+            }],
+        )
+        spreadsheet = FakeSpreadsheet([workers])
+        original_get_sheet = self.module.get_sheet
+        original_now = self.module.now_dt
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.now_dt = lambda: self.module.datetime(
+            2026, 9, 26, 17, 0, tzinfo=self.module.KYIV_TZ
+        )
+        try:
+            self.module.end_shift(message)
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.now_dt = original_now
+
+        pending = user["pending_shift_close"]
+        self.assertEqual(pending["stage"], "cleanup")
+        self.assertEqual(pending["goals"], [])
+        self.assertEqual(self.module.bot.sent[-1][1], "Робоче місце прибрано?")
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            [[self.module.CLEANUP_YES_TEXT, self.module.CLEANUP_NO_TEXT]],
+        )
+
+    def test_close_shift_collects_fact_calculates_above_100_and_marks_cleanup_no(self):
+        message = self.message(self.module.END_SHIFT_TEXT)
+        user = self.active_shift_user(message)
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=["telegram_user_id", "ПІБ", "роль", "бригада", "active"],
+            records=[{
+                "telegram_user_id": "123", "ПІБ": "Іван Петренко", "роль": "Майстер",
+                "бригада": "Резуненко", "active": "TRUE",
+            }],
+        )
+        goal_record = dict(zip(self.module.SHIFT_GOAL_HEADERS, [
+            "goal-1", "shift-test-123", "26.09.2026", "26.09.2026 08:00:00",
+            "capture-2", "2 секція", "Well Place 2", "Особиста", "123",
+            "Іван Петренко", "123", "Іван Петренко", "123", "Іван Петренко",
+            "🕸 Сітка", "Площина", "Молочко", "м²", 10, "", "", "Заплановано", "", "",
+        ]))
+        goals = self.goal_sheet([goal_record])
+        shifts = FakeWorksheet("Зміни", headers=list(self.module.SHIFT_HEADERS))
+        spreadsheet = FakeSpreadsheet([workers, goals, shifts])
+        fixed_now = self.module.datetime(2026, 9, 26, 17, 0, tzinfo=self.module.KYIV_TZ)
+        original_get_sheet = self.module.get_sheet
+        original_now = self.module.now_dt
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.now_dt = lambda: fixed_now
+        try:
+            self.module.end_shift(message)
+            self.assertEqual(user["pending_shift_close"]["stage"], "fact")
+            self.assertIn("Факт виконання", self.module.bot.sent[-1][1])
+            self.assertTrue(self.module.handle_shift_close_text(message, "12,5"))
+            self.assertEqual(user["pending_shift_close"]["stage"], "cleanup")
+            self.assertTrue(
+                self.module.handle_shift_close_text(message, self.module.CLEANUP_NO_TEXT)
+            )
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.now_dt = original_now
+
+        self.assertFalse(user["shift_started"])
+        self.assertEqual(len(shifts.appended), 1)
+        self.assertIn("125%", self.module.bot.sent[-1][1])
+        self.assertIn("Робоче місце прибрано: Ні, не виконано", self.module.bot.sent[-1][1])
+        updated = {goals.headers[column - 1]: value for _, column, value in goals.cell_updates}
+        self.assertEqual(updated["факт"], 12.5)
+        self.assertEqual(updated["виконання, %"], 125.0)
 
     def test_weather_forecast_targets_general_events_without_thread_id(self):
         original_forecast = self.module.get_vynnyky_weather_text
@@ -790,8 +1202,8 @@ class BotEventsTests(unittest.TestCase):
             "Прогноз погоди",
             [button for row in self.module.main_keyboard().rows for button in row],
         )
-        self.assertNotIn(
-            "Прогноз погоди",
+        self.assertIn(
+            "🌦 Прогноз погоди",
             [button for row in self.module.events_keyboard().rows for button in row],
         )
 

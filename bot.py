@@ -16,10 +16,16 @@ from difflib import SequenceMatcher
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import telebot
-from telebot.types import KeyboardButton, ReplyKeyboardMarkup
+from telebot.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
@@ -101,13 +107,32 @@ def handle_dialog_message(message):
     
 def show_status(message):
     user = get_user(message.from_user.id, get_user_name(message))
+    capture = current_goal_capture(user) or {}
+    capture_name = capture.get("name") or "не обрано"
+
+    try:
+        goals = goals_for_user_date(
+            message.from_user.id,
+            now_dt().date(),
+            "",
+        )
+    except Exception as error:
+        print(f"Goal status loading failed: {error}")
+        goals = []
+
+    goal_lines = ["", "Цілі на сьогодні:"]
+    goal_lines.extend(format_goal_progress(goal) for goal in goals)
+    if not goals:
+        goal_lines.append("— Не задано.")
 
     if not user["shift_started"]:
         send_with_keyboard(
             message,
             f"Працівник: {user['full_name']}\n"
             f"Telegram ID: {message.from_user.id}\n"
-            f"Статус: поза зміною"
+            f"Статус: поза зміною\n"
+            f"Захватка: {capture_name}"
+            + "\n".join(goal_lines)
         )
         return
 
@@ -121,7 +146,9 @@ def show_status(message):
         f"Telegram ID: {message.from_user.id}\n"
         f"Початок зміни: {format_datetime(user['shift_start_time'])}\n"
         f"Статус: {'перерва' if user['break_active'] else 'у зміні'}\n"
+        f"Захватка: {capture_name}\n"
         f"Накопичені перерви: {format_duration(user['total_break'] + current_break)}"
+        + "\n".join(goal_lines)
     )
 
     send_with_keyboard(message, status_text)
@@ -707,6 +734,19 @@ END_SHIFT_TEXT = "Кінець зміни"
 STATUS_TEXT = "Мій статус"
 WHO_ON_SHIFT_TEXT = "Хто на зміні"
 WEATHER_FORECAST_TEXT = "Прогноз погоди"
+SHIFT_GOAL_TEXT = "🎯 Ціль зміни"
+EVENTS_STATUS_TEXT = "📊 Мій статус"
+EVENTS_CAPTURE_TEXT = "📍 Обрати захватку"
+EVENTS_WEATHER_TEXT = "🌦 Прогноз погоди"
+GOAL_BACK_TEXT = "⬅️ Назад"
+GOAL_PERSONAL_TEXT = "👤 Особиста"
+GOAL_TEAM_TEXT = "👥 Командна"
+GOAL_SAVE_TEXT = "✅ Зберегти"
+GOAL_EDIT_TEXT = "✏️ Змінити"
+GOAL_ADD_TEXT = "➕ Додати ще"
+GOAL_DONE_TEXT = "✅ Готово"
+CLEANUP_YES_TEXT = "✅ Так"
+CLEANUP_NO_TEXT = "❌ Ні"
 MATERIALS_TEXT = "Взяв"
 MATERIAL_RETURN_TEXT = "Повернув"
 INVENTORY_TEXT = "Інвентаризація"
@@ -832,6 +872,68 @@ SHIFT_HEADERS = [
     "telegram_chat_id",
     "timestamp",
 ]
+
+SHIFT_GOALS_SHEET = "Цілі змін"
+SHIFT_GOAL_HEADERS = [
+    "goal_id", "shift_id", "дата", "початок зміни", "capture_id",
+    "захватка", "обʼєкт", "тип цілі", "creator_id", "створив",
+    "participant_ids", "учасники", "responsible_id", "відповідальний",
+    "процес", "етап", "підпроцес", "одиниця", "план", "факт",
+    "виконання, %", "статус", "створено", "оновлено",
+]
+
+GOAL_PROCESS_TREE = {
+    "🧱 Поклейка": {
+        "Підготовка": [
+            ("Підготовка основи", "м²"),
+            ("Захист вікон", "шт."),
+            ("Люлька / риштування", "секції"),
+            ("Виставлення жилок", "м.п."),
+            ("Стартовий / цокольний профіль", "м.п."),
+            ("Деформаційний профіль / шов", "м.п."),
+        ],
+        "Утеплювач": [
+            ("Примикаюча віконна планка", "м.п."),
+            ("Поклейка утеплювача", "м²"),
+            ("Запінення щілин", "м²"),
+            ("Затирання площі", "м²"),
+            ("Дюбелювання", "м²"),
+        ],
+    },
+    "🕸 Сітка": {
+        "Підготовка під перетяжку": [
+            ("Запінення відкосів", "м.п."),
+            ("Встановлення кутиків", "м.п."),
+            ("Встановлення крапельників", "м.п."),
+            ("Діагональні косинки", "шт."),
+            ("Герметизація примикань", "м.п."),
+            ("Встановлення відливів", "м.п."),
+            ("Перетяжка відкосів", "м.п."),
+        ],
+        "Площина": [
+            ("Попереднє вирівнювання площини", "м²"),
+            ("Перетяжка сіткою", "м²"),
+            ("Молочко", "м²"),
+            ("Корекція площі", "м²"),
+        ],
+    },
+    "🎨 Декор": {
+        "Баранник": [
+            ("Ґрунтування", "м²"),
+            ("Нанесення баранника", "м²"),
+            ("Фарбування", "м²"),
+            ("Миття вікон", "шт."),
+        ],
+    },
+    "🧱 Клінкер": {
+        "": [
+            ("Розмітка площі", "м²"),
+            ("Приклеювання листів", "м²"),
+            ("Фугування", "м²"),
+            ("Обробка гідрофобом", "м²"),
+        ],
+    },
+}
 
 SHIFT_HEADERS = [
     "дата",
@@ -1043,8 +1145,8 @@ def bot_topic_keyboard():
 
 def events_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    markup.row(KeyboardButton(QUESTION_TEXT), KeyboardButton(TASK_TEXT))
-    markup.row(KeyboardButton(ACTIVE_QUESTIONS_TEXT), KeyboardButton(ACTIVE_TASKS_TEXT))
+    markup.row(KeyboardButton(SHIFT_GOAL_TEXT), KeyboardButton(EVENTS_STATUS_TEXT))
+    markup.row(KeyboardButton(EVENTS_CAPTURE_TEXT), KeyboardButton(EVENTS_WEATHER_TEXT))
     return markup
 
 
@@ -1154,11 +1256,14 @@ def get_user(user_id, full_name):
             "shift_worker": None,
             "shift_chat_id": None,
             "shift_thread_id": None,
+            "shift_id": None,
             "auto_close_in_progress": False,
             "pending_material": None,
             "pending_delegate": None,
             "material_for_worker": None,
             "pending_event": None,
+            "pending_goal": None,
+            "pending_shift_close": None,
             "pending_calculation": None,
             "calculations_context": None,
         },
@@ -1187,6 +1292,589 @@ def send_with_keyboard(message, text):
     else:
         keyboard = main_keyboard()
     send_with_markup(message, text, keyboard)
+
+
+def goal_inline_markup(rows):
+    markup = InlineKeyboardMarkup()
+    for row in rows:
+        markup.row(*(InlineKeyboardButton(label, callback_data=data) for label, data in row))
+    return markup
+
+
+def goal_edit_or_send(message, pending, text, markup):
+    message_id = pending.get("goal_message_id")
+    if message_id is not None:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=message.chat.id,
+                message_id=message_id,
+                reply_markup=markup,
+            )
+            return
+        except Exception as error:
+            print(f"Goal message editing failed: {error}")
+
+    options = {"reply_markup": markup}
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is not None:
+        options["message_thread_id"] = thread_id
+    sent_message = bot.send_message(message.chat.id, text, **options)
+    sent_id = getattr(sent_message, "message_id", None)
+    if sent_id is not None:
+        pending["goal_message_id"] = sent_id
+
+
+def goal_breadcrumb(pending):
+    parts = ["Ціль"]
+    if pending.get("process"):
+        parts.append(pending["process"].split(" ", 1)[-1])
+    if pending.get("category"):
+        parts.append(pending["category"])
+    return " → ".join(parts)
+
+
+def paired_inline_rows(items):
+    return [items[index:index + 2] for index in range(0, len(items), 2)]
+
+
+def current_goal_capture(user):
+    return user.get("selected_capture") or user.get("shift_capture")
+
+
+def ensure_shift_id(user):
+    if not user.get("shift_id"):
+        start = user.get("shift_start_time") or now_dt()
+        user["shift_id"] = f"shift-{start:%Y%m%d%H%M%S}-{uuid4().hex[:8]}"
+    return user["shift_id"]
+
+
+def start_shift_goal(message):
+    user = get_user(message.from_user.id, get_user_name(message))
+    if not user.get("shift_started") or user.get("shift_start_time") is None:
+        send_with_keyboard(
+            message,
+            "Спочатку відкрийте зміну у відповідній робочій гілці.",
+        )
+        return
+
+    capture = current_goal_capture(user)
+    if not capture:
+        user["pending_goal"] = {"stage": "waiting_capture"}
+        choose_capture(message)
+        return
+
+    user["pending_goal"] = {
+        "stage": "type",
+        "shift_id": ensure_shift_id(user),
+        "shift_start": user["shift_start_time"],
+        "capture": dict(capture),
+        "creator_id": str(message.from_user.id),
+        "creator_name": get_user_name(message),
+        "selected_participant_ids": {str(message.from_user.id)},
+    }
+    render_goal_step(message, user["pending_goal"])
+
+
+def goal_team_candidates(message, pending):
+    try:
+        workers = get_active_workers()
+    except Exception as error:
+        print(f"Goal team loading failed: {error}")
+        workers = []
+    creator_id = pending["creator_id"]
+    if not any(str(worker["telegram_user_id"]) == creator_id for worker in workers):
+        workers.insert(0, {
+            "telegram_user_id": creator_id,
+            "name": pending["creator_name"],
+            "role": "",
+            "brigade": "",
+        })
+    pending["team_candidates"] = workers
+    pending["team_page"] = 0
+
+
+def render_goal_step(message, pending, error_text=""):
+    stage = pending["stage"]
+    prefix = f"{error_text}\n\n" if error_text else ""
+    breadcrumb = goal_breadcrumb(pending)
+
+    if stage == "type":
+        markup = goal_inline_markup([
+            [
+                (GOAL_PERSONAL_TEXT, "g:type:personal"),
+                (GOAL_TEAM_TEXT, "g:type:team"),
+            ],
+            [(GOAL_BACK_TEXT, "g:cancel")],
+        ])
+        goal_edit_or_send(message, pending, f"{prefix}Ціль\nОберіть тип цілі:", markup)
+        return
+
+    if stage == "team":
+        candidates = pending.get("team_candidates", [])
+        page = pending.get("team_page", 0)
+        page_size = 4
+        visible = candidates[page * page_size:(page + 1) * page_size]
+        selected = pending["selected_participant_ids"]
+        items = []
+        for index, worker in enumerate(visible, start=page * page_size):
+            worker_id = str(worker["telegram_user_id"])
+            marker = "✅ " if worker_id in selected else ""
+            items.append((f"{marker}{worker['name']}", f"g:team:{index}"))
+        rows = paired_inline_rows(items)
+        navigation = []
+        if page > 0:
+            navigation.append(("◀️", "g:team:prev"))
+        if (page + 1) * page_size < len(candidates):
+            navigation.append(("▶️", "g:team:next"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("✅ Учасників обрано", "g:team:done")])
+        rows.append([(GOAL_BACK_TEXT, "g:back")])
+        goal_edit_or_send(
+            message,
+            pending,
+            f"{prefix}Ціль → Командна\nОберіть учасників. Відповідальний за факт: {pending['creator_name']}.",
+            goal_inline_markup(rows),
+        )
+        return
+
+    if stage == "process":
+        items = [
+            (label, f"g:process:{index}")
+            for index, label in enumerate(GOAL_PROCESS_TREE)
+        ]
+        rows = paired_inline_rows(items)
+        rows.append([(GOAL_BACK_TEXT, "g:back")])
+        goal_edit_or_send(
+            message,
+            pending,
+            f"{prefix}Ціль\nОберіть процес:",
+            goal_inline_markup(rows),
+        )
+        return
+
+    if stage == "category":
+        categories = list(GOAL_PROCESS_TREE[pending["process"]])
+        items = [
+            (label or "Роботи", f"g:category:{index}")
+            for index, label in enumerate(categories)
+        ]
+        rows = paired_inline_rows(items)
+        rows.append([(GOAL_BACK_TEXT, "g:back")])
+        goal_edit_or_send(
+            message,
+            pending,
+            f"{prefix}{breadcrumb}\nОберіть етап:",
+            goal_inline_markup(rows),
+        )
+        return
+
+    if stage == "subprocess":
+        subprocesses = GOAL_PROCESS_TREE[pending["process"]][pending["category"]]
+        items = [
+            (label, f"g:subprocess:{index}")
+            for index, (label, _) in enumerate(subprocesses)
+        ]
+        rows = [[item] for item in items]
+        rows.append([(GOAL_BACK_TEXT, "g:back")])
+        goal_edit_or_send(
+            message,
+            pending,
+            f"{prefix}{breadcrumb}\nОберіть підпроцес:",
+            goal_inline_markup(rows),
+        )
+        return
+
+    if stage == "quantity":
+        goal_edit_or_send(
+            message,
+            pending,
+            f"{prefix}{breadcrumb}\n{pending['subprocess']} — {pending['unit']}\n"
+            "Введіть лише планове число, наприклад 25 або 12,5:",
+            goal_inline_markup([[(GOAL_BACK_TEXT, "g:back")]]),
+        )
+        return
+
+    if stage == "confirm":
+        participants = ", ".join(pending["participant_names"])
+        saved_line = "\n\nЦіль збережено." if pending.get("saved") else ""
+        text = (
+            f"{prefix}{breadcrumb}\n\n"
+            f"Захватка: {pending['capture']['name']}\n"
+            f"Тип: {'Командна' if pending['goal_type'] == 'team' else 'Особиста'}\n"
+            f"Учасники: {participants}\n"
+            f"Процес: {pending['process']}\n"
+            f"Підпроцес: {pending['subprocess']}\n"
+            f"План: {format_goal_number(pending['target'])} {pending['unit']}"
+            f"{saved_line}"
+        )
+        markup = goal_inline_markup([
+            [(GOAL_SAVE_TEXT, "g:save"), (GOAL_EDIT_TEXT, "g:edit")],
+            [(GOAL_ADD_TEXT, "g:add"), (GOAL_DONE_TEXT, "g:done")],
+        ])
+        goal_edit_or_send(message, pending, text, markup)
+
+
+def parse_goal_quantity(value):
+    text = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+        raise ValueError("Введіть додатне число, наприклад 25 або 12,5.")
+    number = float(text)
+    if number <= 0:
+        raise ValueError("Значення повинно бути більшим за нуль.")
+    return number
+
+
+def parse_goal_actual(value):
+    text = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+        raise ValueError("Введіть факт числом, наприклад 25 або 12,5.")
+    number = float(text)
+    if number < 0:
+        raise ValueError("Факт не може бути від’ємним.")
+    return number
+
+
+def format_goal_number(value):
+    number = float(value or 0)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def get_shift_goals_worksheet():
+    spreadsheet = get_sheet()
+    try:
+        worksheet = spreadsheet.worksheet(SHIFT_GOALS_SHEET)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=SHIFT_GOALS_SHEET,
+            rows=1000,
+            cols=len(SHIFT_GOAL_HEADERS),
+        )
+        worksheet.update("A1", [SHIFT_GOAL_HEADERS])
+        return worksheet
+
+    headers = worksheet.row_values(1)
+    if not headers:
+        if worksheet.col_count < len(SHIFT_GOAL_HEADERS):
+            worksheet.add_cols(len(SHIFT_GOAL_HEADERS) - worksheet.col_count)
+        worksheet.update("A1", [SHIFT_GOAL_HEADERS])
+        return worksheet
+    if [normalize_sheet_header(value) for value in headers[:len(SHIFT_GOAL_HEADERS)]] != [
+        normalize_sheet_header(value) for value in SHIFT_GOAL_HEADERS
+    ]:
+        raise ValueError(
+            f"Вкладка «{SHIFT_GOALS_SHEET}» має іншу структуру; дані не змінено."
+        )
+    return worksheet
+
+
+def goal_participants(pending):
+    selected = pending["selected_participant_ids"]
+    candidates = pending.get("team_candidates") or []
+    by_id = {str(worker["telegram_user_id"]): worker["name"] for worker in candidates}
+    by_id.setdefault(pending["creator_id"], pending["creator_name"])
+    participant_ids = sorted(selected)
+    return participant_ids, [by_id[user_id] for user_id in participant_ids]
+
+
+def append_shift_goal(message, pending):
+    if pending.get("saved"):
+        return pending["goal_id"]
+    participant_ids, participant_names = goal_participants(pending)
+    pending["participant_names"] = participant_names
+    timestamp = now_dt()
+    goal_id = f"goal-{uuid4().hex}"
+    worksheet = get_shift_goals_worksheet()
+    worksheet.append_row([
+        goal_id,
+        pending["shift_id"],
+        pending["shift_start"].strftime("%d.%m.%Y"),
+        format_datetime(pending["shift_start"]),
+        pending["capture"].get("capture_id", ""),
+        pending["capture"].get("name", ""),
+        pending["capture"].get("project", ""),
+        "Командна" if pending["goal_type"] == "team" else "Особиста",
+        pending["creator_id"],
+        pending["creator_name"],
+        ";".join(participant_ids),
+        "; ".join(participant_names),
+        pending["creator_id"],
+        pending["creator_name"],
+        pending["process"],
+        pending["category"],
+        pending["subprocess"],
+        pending["unit"],
+        pending["target"],
+        "",
+        "",
+        "Заплановано",
+        format_datetime(timestamp),
+        format_datetime(timestamp),
+    ], value_input_option="USER_ENTERED")
+    pending["saved"] = True
+    pending["goal_id"] = goal_id
+    return goal_id
+
+
+def split_goal_participant_ids(value):
+    return {part.strip() for part in str(value or "").split(";") if part.strip()}
+
+
+def goal_record(row, row_number=None):
+    target = sheet_number(get_record_value(row, {"план"}))
+    raw_actual = get_record_value(row, {"факт"})
+    actual = None if str(raw_actual or "").strip() == "" else sheet_number(raw_actual)
+    percentage = None if actual is None or target <= 0 else round(actual / target * 100, 1)
+    return {
+        "row_number": row_number,
+        "goal_id": str(get_record_value(row, {"goal_id"}) or "").strip(),
+        "shift_id": str(get_record_value(row, {"shift_id"}) or "").strip(),
+        "date": str(get_record_value(row, {"дата"}) or "").strip(),
+        "capture": str(get_record_value(row, {"захватка"}) or "").strip(),
+        "creator_id": str(get_record_value(row, {"creator_id"}) or "").strip(),
+        "participant_ids": split_goal_participant_ids(
+            get_record_value(row, {"participant_ids"})
+        ),
+        "responsible_id": str(get_record_value(row, {"responsible_id"}) or "").strip(),
+        "participants": str(get_record_value(row, {"учасники"}) or "").strip(),
+        "process": str(get_record_value(row, {"процес"}) or "").strip(),
+        "category": str(get_record_value(row, {"етап"}) or "").strip(),
+        "subprocess": str(get_record_value(row, {"підпроцес"}) or "").strip(),
+        "unit": str(get_record_value(row, {"одиниця"}) or "").strip(),
+        "target": target,
+        "actual": actual,
+        "percentage": percentage,
+        "status": str(get_record_value(row, {"статус"}) or "Заплановано").strip(),
+    }
+
+
+def load_shift_goal_records():
+    try:
+        worksheet = get_sheet().worksheet(SHIFT_GOALS_SHEET)
+    except gspread.WorksheetNotFound:
+        return None, []
+    records = [
+        goal_record(row, row_number)
+        for row_number, row in enumerate(worksheet.get_all_records(), start=2)
+    ]
+    return worksheet, records
+
+
+def goals_for_user_date(user_id, target_date, capture_name=""):
+    _, goals = load_shift_goal_records()
+    expected_id = str(user_id)
+    expected_date = target_date.strftime("%d.%m.%Y")
+    return [
+        goal
+        for goal in goals
+        if goal["date"] == expected_date
+        and expected_id in goal["participant_ids"]
+        and (not capture_name or goal["capture"] == capture_name)
+    ]
+
+
+def goals_for_active_shift(user, worker_id):
+    shift_start = user.get("shift_start_time")
+    if shift_start is None:
+        return []
+    _, goals = load_shift_goal_records()
+    expected_id = str(worker_id)
+    expected_date = shift_start.strftime("%d.%m.%Y")
+    shift_id = str(user.get("shift_id") or "")
+    return [
+        goal
+        for goal in goals
+        if goal["date"] == expected_date
+        and expected_id in goal["participant_ids"]
+        and (
+            goal["shift_id"] == shift_id
+            or len(goal["participant_ids"]) > 1
+        )
+    ]
+
+
+def update_goal_actual(goal, actual):
+    worksheet, _ = load_shift_goal_records()
+    if worksheet is None or goal.get("row_number") is None:
+        raise ValueError("Запис цілі не знайдено.")
+    headers = worksheet.row_values(1)
+    columns = {
+        normalize_sheet_header(header): index
+        for index, header in enumerate(headers, start=1)
+    }
+    target = goal["target"]
+    percentage = round(actual / target * 100, 1) if target > 0 else 0.0
+    status = "Виконано" if actual >= target else "Частково"
+    values = {
+        "факт": actual,
+        "виконання, %": percentage,
+        "статус": status,
+        "оновлено": format_datetime(now_dt()),
+    }
+    for header, value in values.items():
+        column = columns.get(normalize_sheet_header(header))
+        if column is None:
+            raise ValueError(f"У вкладці «{SHIFT_GOALS_SHEET}» немає колонки «{header}».")
+        worksheet.update_cell(goal["row_number"], column, value)
+    goal.update({"actual": actual, "percentage": percentage, "status": status})
+
+
+def format_goal_progress(goal):
+    fact = "—" if goal.get("actual") is None else format_goal_number(goal["actual"])
+    percentage_value = goal.get("percentage")
+    percentage = "—" if percentage_value is None else f"{format_goal_number(percentage_value)}%"
+    filled = 0 if percentage_value is None else min(10, int(percentage_value // 10))
+    progress_bar = "█" * filled + "░" * (10 - filled)
+    state = "Виконано" if percentage_value is not None and percentage_value >= 100 else "У процесі"
+    shared = "Командна · " if len(goal.get("participant_ids", set())) > 1 else ""
+    return (
+        f"• {goal['subprocess']} · {goal['capture']}\n"
+        f"  {progress_bar} {percentage} · {shared}{state}\n"
+        f"  План {format_goal_number(goal['target'])} {goal['unit']} · Факт {fact} {goal['unit']}"
+    )
+
+
+def reset_goal_for_another(pending):
+    keep = {
+        key: pending[key]
+        for key in (
+            "goal_message_id", "shift_id", "shift_start", "capture", "creator_id",
+            "creator_name", "goal_type", "selected_participant_ids", "team_candidates",
+        )
+        if key in pending
+    }
+    keep["stage"] = "process"
+    return keep
+
+
+def handle_goal_text(message, text):
+    user = get_user(message.from_user.id, get_user_name(message))
+    pending = user.get("pending_goal") or {}
+    if pending.get("stage") != "quantity":
+        return False
+    try:
+        pending["target"] = parse_goal_quantity(text)
+    except ValueError as error:
+        render_goal_step(message, pending, str(error))
+        return True
+    participant_ids, participant_names = goal_participants(pending)
+    pending["selected_participant_ids"] = set(participant_ids)
+    pending["participant_names"] = participant_names
+    pending["stage"] = "confirm"
+    render_goal_step(message, pending)
+    return True
+
+
+def handle_goal_callback(call):
+    message = call.message
+    user = get_user(call.from_user.id, get_user_name(call))
+    pending = user.get("pending_goal") or {}
+    if not pending:
+        bot.answer_callback_query(call.id, "Ця ціль вже закрита.")
+        return
+    pending["goal_message_id"] = getattr(message, "message_id", pending.get("goal_message_id"))
+    data = call.data or ""
+
+    try:
+        if data == "g:cancel":
+            user["pending_goal"] = None
+            goal_edit_or_send(
+                message,
+                pending,
+                "Створення цілі скасовано.",
+                goal_inline_markup([]),
+            )
+            bot.answer_callback_query(call.id)
+            return
+        if data == "g:type:personal":
+            pending["goal_type"] = "personal"
+            pending["stage"] = "process"
+        elif data == "g:type:team":
+            pending["goal_type"] = "team"
+            goal_team_candidates(message, pending)
+            pending["stage"] = "team"
+        elif data.startswith("g:team:"):
+            action = data.rsplit(":", 1)[-1]
+            if action == "prev":
+                pending["team_page"] = max(0, pending.get("team_page", 0) - 1)
+            elif action == "next":
+                pending["team_page"] = pending.get("team_page", 0) + 1
+            elif action == "done":
+                if not pending["selected_participant_ids"]:
+                    render_goal_step(message, pending, "Оберіть хоча б одного учасника.")
+                    bot.answer_callback_query(call.id)
+                    return
+                pending["stage"] = "process"
+            else:
+                worker = pending["team_candidates"][int(action)]
+                worker_id = str(worker["telegram_user_id"])
+                if worker_id == pending["creator_id"]:
+                    bot.answer_callback_query(call.id, "Автор залишається учасником і відповідальним.")
+                    return
+                selected = pending["selected_participant_ids"]
+                selected.discard(worker_id) if worker_id in selected else selected.add(worker_id)
+        elif data.startswith("g:process:"):
+            pending["process"] = list(GOAL_PROCESS_TREE)[int(data.rsplit(":", 1)[-1])]
+            categories = list(GOAL_PROCESS_TREE[pending["process"]])
+            if pending["process"] == "🧱 Клінкер":
+                pending["category"] = categories[0]
+                pending["stage"] = "subprocess"
+            else:
+                pending["stage"] = "category"
+        elif data.startswith("g:category:"):
+            categories = list(GOAL_PROCESS_TREE[pending["process"]])
+            pending["category"] = categories[int(data.rsplit(":", 1)[-1])]
+            pending["stage"] = "subprocess"
+        elif data.startswith("g:subprocess:"):
+            subprocesses = GOAL_PROCESS_TREE[pending["process"]][pending["category"]]
+            pending["subprocess"], pending["unit"] = subprocesses[int(data.rsplit(":", 1)[-1])]
+            pending["stage"] = "quantity"
+        elif data == "g:back":
+            stage = pending["stage"]
+            if stage == "team":
+                pending["stage"] = "type"
+            elif stage == "process":
+                pending["stage"] = "team" if pending.get("goal_type") == "team" else "type"
+            elif stage == "category":
+                pending["stage"] = "process"
+            elif stage == "subprocess":
+                pending["stage"] = "process" if pending.get("process") == "🧱 Клінкер" else "category"
+            elif stage == "quantity":
+                pending["stage"] = "subprocess"
+        elif data == "g:edit":
+            if pending.get("saved"):
+                bot.answer_callback_query(call.id, "Збережену ціль вже не змінюємо.")
+                return
+            pending["stage"] = "quantity"
+        elif data in {"g:save", "g:add", "g:done"}:
+            append_shift_goal(message, pending)
+            if data == "g:add":
+                user["pending_goal"] = reset_goal_for_another(pending)
+                pending = user["pending_goal"]
+            elif data == "g:done":
+                user["pending_goal"] = None
+                goal_edit_or_send(
+                    message,
+                    pending,
+                    "Цілі зміни збережено.",
+                    goal_inline_markup([]),
+                )
+                bot.answer_callback_query(call.id)
+                return
+        render_goal_step(message, pending)
+        bot.answer_callback_query(call.id)
+    except Exception as error:
+        print(f"Goal callback failed: {error}")
+        render_goal_step(message, pending, f"Не вдалося виконати дію: {error}")
+        bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("g:"))
+def goal_callback_handler(call):
+    handle_goal_callback(call)
 
 
 def shift_clock_text(value):
@@ -1421,6 +2109,26 @@ def send_event_record_details(message, pending, error_text=""):
 def handle_events_text(message, text):
     user = get_user(message.from_user.id, get_user_name(message))
 
+    if text == SHIFT_GOAL_TEXT:
+        user["pending_event"] = None
+        start_shift_goal(message)
+        return True
+
+    if text == EVENTS_STATUS_TEXT:
+        user["pending_event"] = None
+        show_status(message)
+        return True
+
+    if text == EVENTS_CAPTURE_TEXT:
+        user["pending_event"] = None
+        choose_capture(message)
+        return True
+
+    if text == EVENTS_WEATHER_TEXT:
+        user["pending_event"] = None
+        show_remaining_weather_forecast(message)
+        return True
+
     if text == ACTIVE_QUESTIONS_TEXT:
         send_active_event_list(message, QUESTION_TEXT)
         return True
@@ -1508,6 +2216,10 @@ def handle_events_text(message, text):
         STATUS_TEXT,
         SELECT_CAPTURE_TEXT,
         MARK_FOR_MASTER_TEXT,
+        SHIFT_GOAL_TEXT,
+        EVENTS_STATUS_TEXT,
+        EVENTS_CAPTURE_TEXT,
+        EVENTS_WEATHER_TEXT,
     }
     if text in main_actions:
         user["pending_event"] = None
@@ -1739,7 +2451,13 @@ def choose_capture(message):
     thread_id = getattr(message, "message_thread_id", None)
     if thread_id is not None:
         options["message_thread_id"] = thread_id
-    bot.send_message(message.chat.id, "Оберіть захватку для наступної зміни:", **options)
+    user = get_user(message.from_user.id, get_user_name(message))
+    prompt = (
+        "Оберіть захватку для цілі зміни:"
+        if (user.get("pending_goal") or {}).get("stage") == "waiting_capture"
+        else "Оберіть захватку для наступної зміни:"
+    )
+    bot.send_message(message.chat.id, prompt, **options)
 
 
 def select_capture(message, capture_name):
@@ -1747,6 +2465,12 @@ def select_capture(message, capture_name):
     for capture in get_active_captures():
         if capture["name"] == capture_name:
             user["selected_capture"] = capture
+            pending_goal = user.get("pending_goal") or {}
+            if pending_goal.get("stage") == "waiting_capture" and user.get("shift_started"):
+                if not user.get("shift_capture"):
+                    user["shift_capture"] = dict(capture)
+                start_shift_goal(message)
+                return True
             send_with_keyboard(message, f"Обрано захватку: {capture['name']}\nОбʼєкт: {capture['project']}")
             return True
     return False
@@ -3216,6 +3940,9 @@ def start_shift(message, target_worker=None, operation_time=None, capture=None):
     user["shift_worker"] = dict(worker)
     user["shift_chat_id"] = message.chat.id
     user["shift_thread_id"] = getattr(message, "message_thread_id", None)
+    user["shift_id"] = f"shift-{shift_start:%Y%m%d%H%M%S}-{uuid4().hex[:8]}"
+    user["pending_goal"] = None
+    user["pending_shift_close"] = None
 
     send_with_keyboard(
         message,
@@ -3319,86 +4046,169 @@ def clear_active_shift(user):
     user["shift_worker"] = None
     user["shift_chat_id"] = None
     user["shift_thread_id"] = None
+    user["shift_id"] = None
+    user["pending_goal"] = None
+    user["pending_shift_close"] = None
     user["auto_close_in_progress"] = False
 
 
-def end_shift(message, target_worker=None, operation_time=None):
-    worker, user = get_shift_subject(message, target_worker)
+def send_shift_goal_fact_prompt(message, pending, error_text=""):
+    goal = pending["goals"][pending["fact_indexes"][pending["fact_position"]]]
+    prefix = f"{error_text}\\n\\n" if error_text else ""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton("Скасувати завершення зміни"))
+    send_with_markup(
+        message,
+        f"{prefix}Факт виконання\\n"
+        f"{goal['subprocess']}\\n"
+        f"План: {format_goal_number(goal['target'])} {goal['unit']}\\n\\n"
+        "Введіть фактичний обсяг числом:",
+        markup,
+    )
 
-    if not user["shift_started"] or user["shift_start_time"] is None:
+
+def send_cleanup_prompt(message, pending):
+    pending["stage"] = "cleanup"
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(KeyboardButton(CLEANUP_YES_TEXT), KeyboardButton(CLEANUP_NO_TEXT))
+    send_with_markup(message, "Робоче місце прибрано?", markup)
+
+
+def shift_close_summary(user, pending, total_time, work_time):
+    cleanup_text = "Так" if pending["cleanup"] else "Ні, не виконано"
+    lines = [
+        user["full_name"],
+        "Кінець зміни зафіксовано.",
+        "",
+        f"Початок: {format_datetime(user['shift_start_time'])}",
+        f"Кінець: {format_datetime(pending['shift_end'])}",
+        f"Захватка: {(user.get('shift_capture') or {}).get('name', '—')}",
+        f"Загальна тривалість: {format_duration(total_time)}",
+        f"Перерви: {format_duration(user['total_break'])}",
+        f"Чистий робочий час: {format_duration(work_time)}",
+    ]
+    if pending["goals"]:
+        lines.extend(["", "Цілі:"])
+        lines.extend(format_goal_progress(goal) for goal in pending["goals"])
+    lines.extend(["", f"Робоче місце прибрано: {cleanup_text}"])
+    return "\\n".join(lines)
+
+
+def complete_shift_close(message, actor, pending):
+    subject = users.get(str(pending["subject_user_id"]))
+    if not subject or not subject.get("shift_started"):
+        actor["pending_shift_close"] = None
+        send_with_keyboard(message, "Активну зміну вже завершено.")
+        return
+    try:
+        total_time, work_time = calculate_shift_duration(subject, pending["shift_end"])
+        save_shift_to_sheet(
+            message,
+            subject,
+            pending["shift_end"],
+            total_time,
+            work_time,
+            pending["worker"],
+        )
+    except Exception as error:
+        print(f"Shift closing failed: {error}")
+        send_cleanup_prompt(message, pending)
+        return
+
+    summary = shift_close_summary(subject, pending, total_time, work_time)
+    clear_active_shift(subject)
+    actor["pending_shift_close"] = None
+    send_with_keyboard(message, summary)
+
+
+def handle_shift_close_text(message, text):
+    actor = get_user(message.from_user.id, get_user_name(message))
+    pending = actor.get("pending_shift_close") or {}
+    if not pending:
+        return False
+
+    if text == "Скасувати завершення зміни":
+        actor["pending_shift_close"] = None
+        send_with_keyboard(message, "Завершення зміни скасовано. Зміна залишається відкритою.")
+        return True
+
+    if pending.get("stage") == "fact":
+        try:
+            actual = parse_goal_actual(text)
+        except ValueError as error:
+            send_shift_goal_fact_prompt(message, pending, str(error))
+            return True
+        goal_index = pending["fact_indexes"][pending["fact_position"]]
+        goal = pending["goals"][goal_index]
+        try:
+            update_goal_actual(goal, actual)
+        except Exception as error:
+            print(f"Goal actual saving failed: {error}")
+            send_shift_goal_fact_prompt(message, pending, f"Не вдалося зберегти факт: {error}")
+            return True
+        pending["fact_position"] += 1
+        if pending["fact_position"] < len(pending["fact_indexes"]):
+            send_shift_goal_fact_prompt(message, pending)
+        else:
+            send_cleanup_prompt(message, pending)
+        return True
+
+    if pending.get("stage") == "cleanup":
+        if text not in {CLEANUP_YES_TEXT, CLEANUP_NO_TEXT}:
+            send_cleanup_prompt(message, pending)
+            return True
+        pending["cleanup"] = text == CLEANUP_YES_TEXT
+        complete_shift_close(message, actor, pending)
+        return True
+
+    return False
+
+
+def end_shift(message, target_worker=None, operation_time=None):
+    worker, subject = get_shift_subject(message, target_worker)
+
+    if not subject["shift_started"] or subject["shift_start_time"] is None:
         send_with_keyboard(message, "Немає активної зміни для завершення.")
         return
-    if user.get("auto_close_in_progress"):
+    if subject.get("auto_close_in_progress"):
         send_with_keyboard(message, "Зміна вже закривається автоматично. Зачекайте кілька секунд.")
         return
 
     shift_end = operation_time or now_dt()
-    if shift_end < user["shift_start_time"]:
+    if shift_end < subject["shift_start_time"]:
         send_with_keyboard(message, "Кінець зміни не може бути раніше її початку.")
         return
     if shift_end > now_dt() + timedelta(minutes=1):
         send_with_keyboard(message, "Кінець зміни не може бути в майбутньому.")
         return
 
+    worker_id = str(worker.get("telegram_user_id") or message.from_user.id)
     try:
-        total_time, work_time = calculate_shift_duration(user, shift_end)
-    except ValueError as error:
-        send_with_keyboard(message, str(error))
-        return
-    save_shift_to_sheet(
-        message,
-        user,
-        shift_end,
-        total_time,
-        work_time,
-        worker,
-    )
-    summary = (
-        f"{user['full_name']}\n"
-        "Кінець зміни зафіксовано.\n\n"
-        f"Початок: {format_datetime(user['shift_start_time'])}\n"
-        f"Кінець: {format_datetime(shift_end)}\n"
-        f"Загальна тривалість: {format_duration(total_time)}\n"
-        f"Перерви: {format_duration(user['total_break'])}\n"
-        f"Чистий робочий час: {format_duration(work_time)}"
-    )
+        goals = goals_for_active_shift(subject, worker_id)
+    except Exception as error:
+        print(f"Shift goals loading failed: {error}")
+        goals = []
 
-    clear_active_shift(user)
-
-    send_with_keyboard(message, summary)
-
-    def show_status(message):
-        user = get_user(message.from_user.id, get_user_name(message))
-
-        if not user["shift_started"]:
-            send_with_keyboard(
-                message,
-                f"Працівник: {user['full_name']}\n"
-                f"Telegram ID: {message.from_user.id}\n"
-                f"Статус: поза зміною"
-            )
-            return
-
-        current_break = timedelta()
-
-        if user["break_active"] and user["break_start_time"] is not None:
-            current_break = now_dt() - user["break_start_time"]
-
-        status_text = (
-            f"Працівник: {user['full_name']}\n"
-            f"Telegram ID: {message.from_user.id}\n"
-            f"Початок зміни: {format_datetime(user['shift_start_time'])}\n"
-            f"Статус: {'перерва' if user['break_active'] else 'у зміні'}\n"
-            f"Накопичені перерви: {format_duration(user['total_break'] + current_break)}"
-        )
-
-        if user["break_active"]:
-            status_text += (
-                f"\nПочаток перерви: "
-                f"{format_datetime(user['break_start_time'])}"
-            )
-
-        send_with_keyboard(message, status_text)
+    actor = get_user(message.from_user.id, get_user_name(message))
+    pending = {
+        "stage": "cleanup",
+        "subject_user_id": worker_id,
+        "worker": dict(worker),
+        "shift_end": shift_end,
+        "goals": goals,
+        "fact_indexes": [
+            index
+            for index, goal in enumerate(goals)
+            if goal.get("actual") is None and goal.get("responsible_id") == worker_id
+        ],
+        "fact_position": 0,
+    }
+    actor["pending_shift_close"] = pending
+    if pending["fact_indexes"]:
+        pending["stage"] = "fact"
+        send_shift_goal_fact_prompt(message, pending)
+    else:
+        send_cleanup_prompt(message, pending)
 
 
 def auto_close_overdue_shift(user_id, user):
@@ -3968,6 +4778,12 @@ def handle_text(message):
         return
 
     if is_events_topic(message) and handle_events_text(message, text):
+        return
+
+    if is_events_topic(message) and handle_goal_text(message, text):
+        return
+
+    if handle_shift_close_text(message, text):
         return
 
     if is_bot_topic(message) and text == WHO_ON_SHIFT_TEXT:
