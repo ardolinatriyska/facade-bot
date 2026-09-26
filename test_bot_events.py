@@ -61,6 +61,7 @@ class FakeTeleBot:
 
 def load_bot_module():
     os.environ["BOT_TOKEN"] = "test-token"
+    os.environ["SASHA_RECEIPT_ALLOWED_USER_IDS"] = "1890913278,5665169791"
 
     telebot_module = types.ModuleType("telebot")
     telebot_module.TeleBot = FakeTeleBot
@@ -228,6 +229,13 @@ class BotEventsTests(unittest.TestCase):
         message = self.message(text)
         message.message_thread_id = int(self.module.CALCULATIONS_THREAD_ID)
         message.chat.id = int(self.module.CALCULATIONS_CHAT_ID)
+        return message
+
+    def sasha_receipt_message(self, text="", user_id=1890913278):
+        message = self.calculations_topic_message(text)
+        message.from_user.id = user_id
+        message.from_user.first_name = "Андрій" if user_id == 1890913278 else "Павло"
+        message.from_user.last_name = "Резуненко" if user_id == 1890913278 else "Майба"
         return message
 
     def calculation_sheets(self, payment_records=None, daily_records=None):
@@ -1708,6 +1716,19 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
+    def test_sasha_button_is_visible_only_to_configured_people(self):
+        base_rows = self.module.calculations_keyboard(123).rows
+        andriy_rows = self.module.calculations_keyboard(1890913278).rows
+        pavlo_rows = self.module.calculations_keyboard("5665169791").rows
+
+        self.assertNotIn([self.module.CALC_SASHA_GAVE_TEXT], base_rows)
+        self.assertEqual(andriy_rows[-1], [self.module.CALC_SASHA_GAVE_TEXT])
+        self.assertEqual(pavlo_rows[-1], [self.module.CALC_SASHA_GAVE_TEXT])
+        self.assertEqual(
+            self.module.SASHA_RECEIPT_ALLOWED_USER_IDS,
+            frozenset({"1890913278", "5665169791"}),
+        )
+
     def test_worker_lookup_supports_live_blank_telegram_id_header(self):
         workers = FakeWorksheet(
             "Працівники",
@@ -1739,6 +1760,198 @@ class BotEventsTests(unittest.TestCase):
             self.module.calculations_keyboard().rows,
         )
 
+    def test_sasha_receipt_flow_writes_only_column_l_after_confirmation(self):
+        spreadsheet = self.calculation_sheets()
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.sasha_receipt_message()
+        try:
+            self.assertTrue(
+                self.module.handle_calculations_text(
+                    message,
+                    self.module.CALC_SASHA_GAVE_TEXT,
+                )
+            )
+            pending = self.module.get_user(
+                message.from_user.id,
+                "Андрій Резуненко",
+            )["pending_calculation"]
+            self.assertEqual(pending["stage"], "sasha_kind")
+            self.assertEqual(
+                self.module.bot.sent[-1][2]["reply_markup"].rows,
+                [["Аванс", "Розрахунок"], [self.module.CALC_CANCEL_TEXT]],
+            )
+
+            for text in ("Аванс", "Well Place", "2 низ", "2500,50"):
+                self.assertTrue(self.module.handle_calculations_text(message, text))
+
+            self.assertEqual(pending["stage"], "confirm")
+            self.assertEqual(spreadsheet.sheets["Виплати"].appended, [])
+            confirmation = self.module.bot.sent[-1][1]
+            self.assertIn("Операція: Саша дав", confirmation)
+            self.assertIn("Тип: Аванс", confirmation)
+            self.assertNotIn("Коментар", confirmation)
+
+            self.assertTrue(
+                self.module.handle_calculations_text(
+                    message,
+                    self.module.CALC_CONFIRM_TEXT,
+                )
+            )
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        row, options = spreadsheet.sheets["Виплати"].appended[0]
+        self.assertEqual(options, {"value_input_option": "USER_ENTERED"})
+        self.assertEqual(row[1:], [
+            "", 0.0, 0.0, "", "Саша дав — Аванс", "Well Place", "2 низ",
+            "Не застосовується", "Андрій Резуненко", "1890913278", 2500.5,
+        ])
+
+    def test_sasha_receipt_supports_settlement_subtype(self):
+        spreadsheet = self.calculation_sheets()
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        message = self.sasha_receipt_message(user_id=5665169791)
+        try:
+            for text in (
+                self.module.CALC_SASHA_GAVE_TEXT,
+                self.module.CALC_SASHA_SETTLEMENT_TEXT,
+                "Well Place",
+                "2 низ",
+                "10000",
+                self.module.CALC_CONFIRM_TEXT,
+            ):
+                self.assertTrue(self.module.handle_calculations_text(message, text))
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        row, _ = spreadsheet.sheets["Виплати"].appended[0]
+        self.assertEqual(row[5], "Саша дав — Розрахунок")
+        self.assertEqual(row[9:12], ["Павло Майба", "5665169791", 10000.0])
+
+    def test_unauthorized_user_cannot_start_or_forge_sasha_receipt(self):
+        message = self.calculations_topic_message(self.module.CALC_SASHA_GAVE_TEXT)
+
+        self.assertTrue(
+            self.module.handle_calculations_text(
+                message,
+                self.module.CALC_SASHA_GAVE_TEXT,
+            )
+        )
+        user = self.module.get_user(message.from_user.id, "Іван Петренко")
+        self.assertIsNone(user["pending_calculation"])
+        self.assertIn("доступна тільки", self.module.bot.sent[-1][1])
+
+        spreadsheet = self.calculation_sheets()
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            with self.assertRaises(PermissionError):
+                self.module.append_payment_operation(message, {
+                    "worker": None,
+                    "amount": 5000,
+                    "comment": "",
+                    "type": "Саша дав — Аванс",
+                    "source": "Саша",
+                    "object": {"name": "Well Place"},
+                    "capture": {"name": "2 низ"},
+                    "capture_status": "Не застосовується",
+                })
+        finally:
+            self.module.get_sheet = original_get_sheet
+        self.assertEqual(spreadsheet.sheets["Виплати"].appended, [])
+
+    def test_payments_schema_requires_new_receipt_column_l(self):
+        legacy_headers = list(self.module.PAYMENT_HEADERS[:-1])
+        worksheet = FakeWorksheet("Виплати", headers=legacy_headers)
+
+        with self.assertRaisesRegex(ValueError, "A:L"):
+            self.module.validate_payments_sheet(worksheet)
+
+    def test_decimal_comma_hours_are_not_numericised_as_thousands(self):
+        spreadsheet = self.calculation_sheets(daily_records=[
+            {"Дата": "04.09.2026", "Працівник": "Коваль Роман", "Години": "9,08"},
+            {"Дата": "16.09.2026", "Працівник": "Коваль Роман", "Години": "12,82"},
+        ])
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            worker = self.module.get_active_payment_workers()[1]
+            summary = self.module.get_worker_financial_summary(worker)
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(summary["hours"], 21.9)
+        self.assertEqual(summary["accrued"], 5475.0)
+
+    def test_formatted_decimal_comma_rates_and_payments_keep_their_scale(self):
+        spreadsheet = self.calculation_sheets(
+            payment_records=[{
+                "Дата": "20.09.2026",
+                "Працівник": "Коваль Роман",
+                "Виплачено, грн": "500,00",
+                "Коригування, грн": "0,00",
+            }],
+            daily_records=[{
+                "Дата": "20.09.2026",
+                "Працівник": "Коваль Роман",
+                "Години": "4,00",
+            }],
+        )
+        spreadsheet.sheets["Працівники"].records[1]["ставка, грн/год"] = "250,00"
+        spreadsheet.sheets["Працівники"].records[1]["початковий баланс, грн"] = "100,00"
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            worker = self.module.get_active_payment_workers()[1]
+            summary = self.module.get_worker_financial_summary(worker)
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(worker["rate"], 250.0)
+        self.assertEqual(worker["initial_balance"], 100.0)
+        self.assertEqual(summary["paid"], 500.0)
+        self.assertEqual(summary["balance"], 600.0)
+
+    def test_sasha_receipt_amount_never_changes_worker_balance(self):
+        spreadsheet = self.calculation_sheets(
+            payment_records=[{
+                "Дата": "20.09.2026",
+                "Працівник": "Коваль Роман",
+                "Виплачено, грн": 500,
+                "Коригування, грн": 0,
+                "Тип операції": "Аванс",
+                "Отримано від Саші, грн": 0,
+            }, {
+                "Дата": "21.09.2026",
+                "Працівник": "Коваль Роман",
+                "Виплачено, грн": 0,
+                "Коригування, грн": 0,
+                "Тип операції": "Саша дав — Аванс",
+                "Отримано від Саші, грн": 10000,
+            }],
+            daily_records=[
+                {"Дата": "20.09.2026", "Працівник": "Коваль Роман", "Години": "4,0"},
+            ],
+        )
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            worker = self.module.get_active_payment_workers()[1]
+            summary = self.module.get_worker_financial_summary(worker)
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(summary["paid"], 500.0)
+        self.assertEqual(summary["balance"], 600.0)
+
+    def test_money_parser_still_accepts_decimal_comma_and_grouped_spaces(self):
+        self.assertEqual(
+            self.module.parse_calculation_amount("2 500,50 грн", "Аванс"),
+            2500.5,
+        )
+
     def test_advance_flow_filters_captures_and_appends_exact_payment_row(self):
         spreadsheet = self.calculation_sheets()
         self.module.get_sheet = lambda: spreadsheet
@@ -1761,7 +1974,7 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(options, {"value_input_option": "USER_ENTERED"})
         self.assertEqual(row[1:], [
             "Коваль Роман", 2500.5, 0.0, "", "Аванс", "Well Place", "2 низ",
-            "Відкрита", "Іван Петренко", "123",
+            "Відкрита", "Іван Петренко", "123", 0.0,
         ])
         self.assertEqual(spreadsheet.created, [])
 

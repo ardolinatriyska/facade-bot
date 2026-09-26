@@ -46,6 +46,17 @@ BOT_TOPIC_CHAT_ID = os.getenv("BOT_TOPIC_CHAT_ID", str(WEATHER_CHAT_ID))
 BOT_TOPIC_THREAD_ID = os.getenv("BOT_TOPIC_THREAD_ID", "82")
 CALCULATIONS_CHAT_ID = os.getenv("CALCULATIONS_CHAT_ID", str(WEATHER_CHAT_ID))
 CALCULATIONS_THREAD_ID = os.getenv("CALCULATIONS_THREAD_ID")
+SASHA_RECEIPT_ALLOWED_USER_IDS = frozenset(
+    item
+    for item in re.split(
+        r"[,;\s]+",
+        os.getenv(
+            "SASHA_RECEIPT_ALLOWED_USER_IDS",
+            "1890913278,5665169791",
+        ).strip(),
+    )
+    if item
+)
 WEATHER_LATITUDE = 49.8157
 WEATHER_LONGITUDE = 24.1346
 
@@ -497,10 +508,23 @@ def sheet_number(value):
         return 0.0
 
 
+def get_all_records_preserving_formatted_values(worksheet):
+    """Return rows without gspread turning decimal commas into thousands."""
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    records = []
+    for row in values[1:]:
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        records.append(dict(zip(headers, padded)))
+    return records
+
+
 def get_active_payment_workers():
     worksheet = get_sheet().worksheet("Працівники")
     workers = []
-    for row in worksheet.get_all_records():
+    for row in get_all_records_preserving_formatted_values(worksheet):
         name = str(get_record_value(row, {"піб", "працівник", "name"}) or "").strip()
         active = get_record_value(row, {"active", "активний", "активна"})
         if not name or not is_active_sheet_value(active):
@@ -552,7 +576,7 @@ def validate_payments_sheet(worksheet):
         normalize_sheet_header(value) for value in PAYMENT_HEADERS
     ]:
         raise ValueError(
-            "Вкладка «Виплати» повинна мати колонки A:K у погодженому порядку."
+            "Вкладка «Виплати» повинна мати колонки A:L у погодженому порядку."
         )
 
 
@@ -560,12 +584,20 @@ def append_payment_operation(message, operation):
     worksheet = get_sheet().worksheet(PAYMENTS_SHEET)
     validate_payments_sheet(worksheet)
     amount = operation.get("amount", 0.0)
-    paid = amount if operation["type"] in {"Аванс", "Повний розрахунок"} else 0.0
+    is_sasha_receipt = operation.get("source") == "Саша"
+    if is_sasha_receipt and not can_record_sasha_receipt(message.from_user.id):
+        raise PermissionError("Ця дія доступна тільки Андрію Резуненку та Майбі Павлу.")
+    paid = (
+        amount
+        if not is_sasha_receipt and operation["type"] in {"Аванс", "Повний розрахунок"}
+        else 0.0
+    )
     adjustment = amount if operation["type"] == "Коригування" else 0.0
+    worker = operation.get("worker") or {}
     worksheet.append_row(
         [
             now_dt().strftime("%d.%m.%Y"),
-            operation["worker"]["name"],
+            "" if is_sasha_receipt else worker.get("name", ""),
             paid,
             adjustment,
             operation.get("comment", ""),
@@ -575,6 +607,7 @@ def append_payment_operation(message, operation):
             operation.get("capture_status", "Відкрита"),
             get_user_name(message),
             str(message.from_user.id),
+            amount if is_sasha_receipt else 0.0,
         ],
         value_input_option="USER_ENTERED",
     )
@@ -602,7 +635,7 @@ def get_worker_financial_summary(worker):
     daily_sheet = spreadsheet.worksheet("Денні дані")
     total_hours = sum(
         sheet_number(get_record_value(row, {"години", "hours"}))
-        for row in daily_sheet.get_all_records()
+        for row in get_all_records_preserving_formatted_values(daily_sheet)
         if str(get_record_value(row, {"працівник", "піб", "worker"}) or "").strip().casefold()
         == worker_name.casefold()
     )
@@ -610,7 +643,7 @@ def get_worker_financial_summary(worker):
     validate_payments_sheet(payments_sheet)
     payment_rows = [
         row
-        for row in payments_sheet.get_all_records()
+        for row in get_all_records_preserving_formatted_values(payments_sheet)
         if str(get_record_value(row, {"працівник"}) or "").strip().casefold()
         == worker_name.casefold()
     ]
@@ -780,6 +813,9 @@ CALC_ADJUSTMENT_TEXT = "✏️ Коригування"
 CALC_BALANCE_TEXT = "📊 Баланс працівника"
 CALC_HISTORY_TEXT = "📜 Історія виплат"
 CALC_CLOSE_CAPTURE_TEXT = "🏁 Закрити захватку"
+CALC_SASHA_GAVE_TEXT = "💰 Саша дав"
+CALC_SASHA_ADVANCE_TEXT = "Аванс"
+CALC_SASHA_SETTLEMENT_TEXT = "Розрахунок"
 CALC_CONFIRM_TEXT = "Підтвердити"
 CALC_CANCEL_TEXT = "Скасувати розрахунок"
 CALC_SKIP_COMMENT_TEXT = "Пропустити"
@@ -788,7 +824,7 @@ PAYMENTS_SHEET = "Виплати"
 PAYMENT_HEADERS = [
     "Дата", "Працівник", "Виплачено, грн", "Коригування, грн", "Коментар",
     "Тип операції", "Об’єкт", "Захватка", "Статус захватки", "Хто вніс",
-    "Telegram ID",
+    "Telegram ID", "Отримано від Саші, грн",
 ]
 
 ACTIVE_EVENT_STATUS = "Активне"
@@ -1159,11 +1195,17 @@ def materials_keyboard():
     return markup
 
 
-def calculations_keyboard():
+def can_record_sasha_receipt(user_id):
+    return str(user_id).strip() in SASHA_RECEIPT_ALLOWED_USER_IDS
+
+
+def calculations_keyboard(user_id=None):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     markup.row(KeyboardButton(CALC_ADVANCE_TEXT), KeyboardButton(CALC_FULL_PAYMENT_TEXT))
     markup.row(KeyboardButton(CALC_ADJUSTMENT_TEXT), KeyboardButton(CALC_BALANCE_TEXT))
     markup.row(KeyboardButton(CALC_HISTORY_TEXT), KeyboardButton(CALC_CLOSE_CAPTURE_TEXT))
+    if can_record_sasha_receipt(user_id):
+        markup.row(KeyboardButton(CALC_SASHA_GAVE_TEXT))
     return markup
 
 
@@ -1282,7 +1324,7 @@ def send_with_markup(message, text, markup):
 
 def send_with_keyboard(message, text):
     if is_calculations_topic(message):
-        keyboard = calculations_keyboard()
+        keyboard = calculations_keyboard(message.from_user.id)
     elif is_materials_topic(message):
         keyboard = materials_keyboard()
     elif is_events_topic(message):
@@ -4338,6 +4380,17 @@ def send_calculation_worker_prompt(message, pending, error_text=""):
     send_with_markup(message, f"{prefix}Оберіть працівника:", markup)
 
 
+def send_sasha_receipt_kind_prompt(message, error_text=""):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row(
+        KeyboardButton(CALC_SASHA_ADVANCE_TEXT),
+        KeyboardButton(CALC_SASHA_SETTLEMENT_TEXT),
+    )
+    markup.row(KeyboardButton(CALC_CANCEL_TEXT))
+    prefix = f"{error_text}\n\n" if error_text else ""
+    send_with_markup(message, f"{prefix}Що передав Саша?", markup)
+
+
 def send_calculation_object_prompt(message, pending, error_text=""):
     objects = pending["objects"]
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -4368,11 +4421,21 @@ def send_calculation_amount_prompt(message, pending, error_text=""):
         if pending["operation_type"] == "Коригування"
         else "Введіть додатну суму, наприклад: 2500."
     )
+    if pending.get("action") == CALC_SASHA_GAVE_TEXT:
+        context = (
+            f"Саша дав: {pending['receipt_kind']}\n"
+            f"Об’єкт: {pending['object']['name']}\n"
+            f"Захватка: {pending['capture']['name']}"
+        )
+    else:
+        context = (
+            f"Працівник: {pending['worker']['name']}\n"
+            f"Об’єкт: {pending['object']['name']}\n"
+            f"Захватка: {pending['capture']['name']}"
+        )
     send_with_markup(
         message,
-        f"{prefix}Працівник: {pending['worker']['name']}\n"
-        f"Об’єкт: {pending['object']['name']}\n"
-        f"Захватка: {pending['capture']['name']}\n\n{sign_hint}",
+        f"{prefix}{context}\n\n{sign_hint}",
         calculation_cancel_keyboard(),
     )
 
@@ -4385,15 +4448,24 @@ def send_calculation_comment_prompt(message, pending):
 
 
 def calculation_confirmation_text(pending):
-    lines = [
-        f"Операція: {pending['operation_type']}",
-        f"Працівник: {pending['worker']['name']}",
-        f"Об’єкт: {pending['object']['name']}",
-        f"Захватка: {pending['capture']['name']}",
-    ]
+    if pending.get("action") == CALC_SASHA_GAVE_TEXT:
+        lines = [
+            "Операція: Саша дав",
+            f"Тип: {pending['receipt_kind']}",
+            f"Об’єкт: {pending['object']['name']}",
+            f"Захватка: {pending['capture']['name']}",
+        ]
+    else:
+        lines = [
+            f"Операція: {pending['operation_type']}",
+            f"Працівник: {pending['worker']['name']}",
+            f"Об’єкт: {pending['object']['name']}",
+            f"Захватка: {pending['capture']['name']}",
+        ]
     if pending["operation_type"] != "Закриття захватки":
         lines.append(f"Сума: {format_money(pending['amount'])} грн")
-    lines.append(f"Коментар: {pending.get('comment') or '—'}")
+    if pending.get("action") != CALC_SASHA_GAVE_TEXT:
+        lines.append(f"Коментар: {pending.get('comment') or '—'}")
     return "\n".join(lines) + "\n\nПідтвердити операцію?"
 
 
@@ -4407,6 +4479,21 @@ def start_calculation_flow(message, action):
     user = get_user(message.from_user.id, get_user_name(message))
     chat_id, thread_id = message_context(message)
     pending = {"action": action, "chat_id": chat_id, "thread_id": thread_id}
+
+    if action == CALC_SASHA_GAVE_TEXT:
+        if not can_record_sasha_receipt(message.from_user.id):
+            send_with_keyboard(
+                message,
+                "Кнопка «Саша дав» доступна тільки Андрію Резуненку та Майбі Павлу.",
+            )
+            return
+        pending.update({
+            "stage": "sasha_kind",
+            "source": "Саша",
+        })
+        user["pending_calculation"] = pending
+        send_sasha_receipt_kind_prompt(message)
+        return
 
     if action == CALC_CLOSE_CAPTURE_TEXT:
         worker = get_worker(message.from_user.id)
@@ -4515,6 +4602,7 @@ def handle_calculations_text(message, text):
         CALC_BALANCE_TEXT,
         CALC_HISTORY_TEXT,
         CALC_CLOSE_CAPTURE_TEXT,
+        CALC_SASHA_GAVE_TEXT,
     }
     if text in actions:
         try:
@@ -4526,6 +4614,35 @@ def handle_calculations_text(message, text):
 
     if not pending:
         send_with_keyboard(message, "Оберіть дію в меню «Розрахунки».")
+        return True
+
+    if (
+        pending.get("action") == CALC_SASHA_GAVE_TEXT
+        and not can_record_sasha_receipt(message.from_user.id)
+    ):
+        user["pending_calculation"] = None
+        send_with_keyboard(
+            message,
+            "Кнопка «Саша дав» доступна тільки Андрію Резуненку та Майбі Павлу.",
+        )
+        return True
+
+    if pending["stage"] == "sasha_kind":
+        if text not in {CALC_SASHA_ADVANCE_TEXT, CALC_SASHA_SETTLEMENT_TEXT}:
+            send_sasha_receipt_kind_prompt(message, "Оберіть «Аванс» або «Розрахунок».")
+            return True
+        objects = get_active_objects(create_if_missing=False)
+        if not objects:
+            user["pending_calculation"] = None
+            send_with_keyboard(message, "У таблиці немає активних об’єктів.")
+            return True
+        pending.update({
+            "stage": "object",
+            "receipt_kind": text,
+            "operation_type": f"Саша дав — {text}",
+            "objects": objects,
+        })
+        send_calculation_object_prompt(message, pending)
         return True
 
     if pending["stage"] == "worker":
@@ -4602,8 +4719,13 @@ def handle_calculations_text(message, text):
         except ValueError as error:
             send_calculation_amount_prompt(message, pending, str(error))
             return True
-        pending["stage"] = "comment"
-        send_calculation_comment_prompt(message, pending)
+        if pending.get("action") == CALC_SASHA_GAVE_TEXT:
+            pending["comment"] = ""
+            pending["stage"] = "confirm"
+            send_calculation_confirmation(message, pending)
+        else:
+            pending["stage"] = "comment"
+            send_calculation_comment_prompt(message, pending)
         return True
 
     if pending["stage"] == "comment":
@@ -4618,16 +4740,21 @@ def handle_calculations_text(message, text):
             return True
         try:
             operation = {
-                "worker": pending["worker"],
+                "worker": pending.get("worker"),
                 "amount": pending.get("amount", 0.0),
                 "comment": pending.get("comment", ""),
                 "type": pending["operation_type"],
+                "source": pending.get("source", ""),
                 "object": pending["object"],
                 "capture": pending["capture"],
                 "capture_status": (
                     "Закрита"
                     if pending["operation_type"] == "Закриття захватки"
-                    else "Відкрита"
+                    else (
+                        "Не застосовується"
+                        if pending.get("action") == CALC_SASHA_GAVE_TEXT
+                        else "Відкрита"
+                    )
                 ),
             }
             if pending["operation_type"] == "Закриття захватки":
@@ -4651,13 +4778,20 @@ def handle_calculations_text(message, text):
             if pending["operation_type"] == "Закриття захватки"
             else f"\nСума: {format_money(pending['amount'])} грн"
         )
-        send_with_keyboard(
-            message,
-            f"Записано: {pending['operation_type']}\n"
-            f"Працівник: {pending['worker']['name']}\n"
-            f"Об’єкт: {pending['object']['name']}\n"
-            f"Захватка: {pending['capture']['name']}{amount_line}",
-        )
+        if pending.get("action") == CALC_SASHA_GAVE_TEXT:
+            result_text = (
+                f"Записано: Саша дав — {pending['receipt_kind']}\n"
+                f"Об’єкт: {pending['object']['name']}\n"
+                f"Захватка: {pending['capture']['name']}{amount_line}"
+            )
+        else:
+            result_text = (
+                f"Записано: {pending['operation_type']}\n"
+                f"Працівник: {pending['worker']['name']}\n"
+                f"Об’єкт: {pending['object']['name']}\n"
+                f"Захватка: {pending['capture']['name']}{amount_line}"
+            )
+        send_with_keyboard(message, result_text)
         return True
 
     return True
@@ -4672,7 +4806,7 @@ def calculations_command(message):
     send_with_markup(
         message,
         "Меню «Розрахунки» активовано в цій гілці.",
-        calculations_keyboard(),
+        calculations_keyboard(message.from_user.id),
     )
 
 
