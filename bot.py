@@ -1222,10 +1222,17 @@ def is_materials_topic(message):
 def is_events_topic(message):
     """Event actions are shown only in the configured «Події» topic."""
     thread_id = getattr(message, "message_thread_id", None)
+    configured_thread_id = str(EVENTS_THREAD_ID).strip() if EVENTS_THREAD_ID else ""
+    # Telegram omits message_thread_id for the General topic. In WellPlaceBOT
+    # that topic is renamed to «Події» and is configured as topic 1.
+    matches_events_thread = (
+        str(thread_id) == configured_thread_id
+        or (thread_id is None and configured_thread_id == "1")
+    )
     return (
         bool(EVENTS_CHAT_ID and EVENTS_THREAD_ID)
         and str(message.chat.id) == str(EVENTS_CHAT_ID)
-        and str(thread_id) == str(EVENTS_THREAD_ID)
+        and matches_events_thread
     )
 
 

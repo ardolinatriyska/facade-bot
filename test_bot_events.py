@@ -367,6 +367,26 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
+    def test_general_topic_without_thread_id_is_detected_as_events(self):
+        message = self.message("/start")
+        message.message_thread_id = None
+
+        self.assertTrue(self.module.is_events_topic(message))
+
+        self.module.start_command(message)
+
+        self.assertEqual(
+            self.module.bot.sent[-1][2]["reply_markup"].rows,
+            self.module.events_keyboard().rows,
+        )
+
+    def test_missing_thread_id_in_another_chat_is_not_events(self):
+        message = self.message()
+        message.message_thread_id = None
+        message.chat.id = -1009999999999
+
+        self.assertFalse(self.module.is_events_topic(message))
+
     def test_events_menu_does_not_move_time_controls_from_work_menu(self):
         event_buttons = [button for row in self.module.events_keyboard().rows for button in row]
         work_buttons = [button for row in self.module.main_keyboard().rows for button in row]
