@@ -1,7 +1,10 @@
 import importlib.util
 import json
 import os
+import re
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -144,11 +147,35 @@ class FakeWorksheet:
             for record in self.records
         ]
 
-    def update(self, cell, values):
+    def update(self, cell=None, values=None, range_name=None):
+        cell = range_name or cell
         self.updated.append((cell, values))
-        self.headers = list(values[0])
-        self.records = [dict(zip(self.headers, row)) for row in values[1:]]
-        self.col_count = max(self.col_count, len(self.headers))
+        if cell == "A1":
+            self.headers = list(values[0])
+            self.records = [dict(zip(self.headers, row)) for row in values[1:]]
+            self.col_count = max(self.col_count, len(self.headers))
+            return
+
+        match = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", cell)
+        if not match:
+            return
+
+        def column_number(label):
+            result = 0
+            for character in label:
+                result = result * 26 + ord(character) - ord("A") + 1
+            return result
+
+        start_column = column_number(match.group(1))
+        start_row = int(match.group(2))
+        for row_offset, row_values in enumerate(values):
+            record_index = start_row - 2 + row_offset
+            while len(self.records) <= record_index:
+                self.records.append({})
+            for column_offset, value in enumerate(row_values):
+                header_index = start_column - 1 + column_offset
+                if header_index < len(self.headers):
+                    self.records[record_index][self.headers[header_index]] = value
 
     def add_cols(self, count):
         self.col_count += count
@@ -343,13 +370,51 @@ class BotEventsTests(unittest.TestCase):
             records=list(records or []),
         )
 
+    def selected_capture_spreadsheet(self, capture=None):
+        if capture is None:
+            capture = {
+                "capture_id": "capture-2",
+                "name": "2 секція",
+                "project": "Well Place 2",
+            }
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=[
+                "telegram_user_id", "ПІБ", "роль", "бригада", "active", "примітка",
+                "ставка, грн/год", "початковий баланс, грн", "capture_id",
+                "обрана захватка", "обʼєкт захватки",
+            ],
+            records=[{
+                "telegram_user_id": "123",
+                "ПІБ": "Іван Петренко",
+                "роль": "Майстер",
+                "бригада": "Резуненко",
+                "active": "TRUE",
+                "capture_id": capture.get("capture_id", ""),
+                "обрана захватка": capture.get("name", ""),
+                "обʼєкт захватки": capture.get("project", ""),
+            }],
+        )
+        captures = FakeWorksheet(
+            "Захватки",
+            headers=["capture_id", "назва", "обʼєкт", "active"],
+            records=[{
+                "capture_id": capture.get("capture_id", ""),
+                "назва": capture.get("name", ""),
+                "обʼєкт": capture.get("project", ""),
+                "active": "TRUE",
+            }],
+        )
+        return FakeSpreadsheet([workers, captures])
+
     def advance_personal_goal_to_quantity(self, message, process_index=1, category_index=1, subprocess_index=1):
         self.module.start_shift_goal(message)
         self.module.handle_goal_callback(self.callback(message, "g:type:personal"))
         self.module.handle_goal_callback(
             self.callback(message, f"g:process:{process_index}")
         )
-        if list(self.module.GOAL_PROCESS_TREE)[process_index] != "🧱 Клінкер":
+        process = list(self.module.GOAL_PROCESS_TREE)[process_index]
+        if list(self.module.GOAL_PROCESS_TREE[process]) != [""]:
             self.module.handle_goal_callback(
                 self.callback(message, f"g:category:{category_index}")
             )
@@ -449,6 +514,168 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(calls, [message])
         self.assertEqual(user["pending_goal"]["stage"], "waiting_capture")
 
+    def test_selected_capture_is_saved_in_worker_columns_and_restored_after_restart(self):
+        message = self.message()
+        capture = {
+            "capture_id": "capture-7",
+            "name": "7 верх",
+            "project": "Well Place 2",
+        }
+        spreadsheet = self.selected_capture_spreadsheet({})
+        worker_sheet = spreadsheet.sheets["Працівники"]
+        worker_sheet.headers[0] = ""
+        worker_sheet.records[0][""] = worker_sheet.records[0].pop("telegram_user_id")
+        captures = spreadsheet.sheets["Захватки"]
+        captures.records = [{
+            "capture_id": capture["capture_id"],
+            "назва": capture["name"],
+            "обʼєкт": capture["project"],
+            "active": "TRUE",
+        }]
+        original_get_sheet = self.module.get_sheet
+        original_sheet_id = self.module.SHEET_ID
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.SHEET_ID = "test-sheet"
+        try:
+            self.assertTrue(self.module.select_capture(message, capture["name"]))
+            self.assertEqual(
+                worker_sheet.updated,
+                [(
+                    "I2:K2",
+                    [[capture["capture_id"], capture["name"], capture["project"]]],
+                )],
+            )
+
+            self.module.users.clear()
+            restored = self.module.get_user(message.from_user.id, "Іван Петренко")
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.SHEET_ID = original_sheet_id
+
+        self.assertEqual(restored["selected_capture"], capture)
+
+    def test_selected_capture_save_error_keeps_previous_in_memory_selection(self):
+        message = self.message()
+        previous_capture = {
+            "capture_id": "capture-old",
+            "name": "Стара",
+            "project": "Well Place 2",
+        }
+        next_capture = {
+            "capture_id": "capture-new",
+            "name": "Нова",
+            "project": "Well Place 2",
+        }
+        user = self.module.get_user(message.from_user.id, "Іван Петренко")
+        user["selected_capture"] = dict(previous_capture)
+        original_get_captures = self.module.get_active_captures
+        original_persist = self.module.persist_selected_capture
+        self.module.get_active_captures = lambda: [next_capture]
+
+        def fail_to_persist(user_id, capture):
+            raise RuntimeError("write failed")
+
+        self.module.persist_selected_capture = fail_to_persist
+        try:
+            self.assertTrue(self.module.select_capture(message, next_capture["name"]))
+        finally:
+            self.module.get_active_captures = original_get_captures
+            self.module.persist_selected_capture = original_persist
+
+        self.assertEqual(user["selected_capture"], previous_capture)
+        self.assertIn("Не вдалося зберегти захватку", self.module.bot.sent[-1][1])
+
+    def test_start_shift_uses_capture_restored_from_worker_row(self):
+        message = self.message()
+        capture = {
+            "capture_id": "capture-4",
+            "name": "4 низ",
+            "project": "Well Place 2",
+        }
+        spreadsheet = self.selected_capture_spreadsheet(capture)
+        original_get_sheet = self.module.get_sheet
+        original_sheet_id = self.module.SHEET_ID
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.SHEET_ID = "test-sheet"
+        try:
+            self.module.start_shift(message)
+            user = self.module.users[str(message.from_user.id)]
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.SHEET_ID = original_sheet_id
+
+        self.assertTrue(user["shift_started"])
+        self.assertEqual(user["selected_capture"], capture)
+        self.assertEqual(user["shift_capture"], capture)
+        self.assertIn("Захватка: 4 низ", self.module.bot.sent[-1][1])
+        self.assertNotIn(
+            "Спершу оберіть захватку",
+            "\n".join(text for _, text, _ in self.module.bot.sent),
+        )
+
+    def test_goal_uses_restored_capture_when_shift_has_no_capture(self):
+        message = self.message()
+        capture = {
+            "capture_id": "capture-5",
+            "name": "5 верх",
+            "project": "Well Place 2",
+        }
+        spreadsheet = self.selected_capture_spreadsheet(capture)
+        original_get_sheet = self.module.get_sheet
+        original_sheet_id = self.module.SHEET_ID
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.SHEET_ID = "test-sheet"
+        try:
+            user = self.module.get_user(message.from_user.id, "Іван Петренко")
+            user.update({
+                "shift_started": True,
+                "shift_start_time": self.module.datetime(
+                    2026, 9, 26, 8, 0, tzinfo=self.module.KYIV_TZ
+                ),
+                "shift_id": "shift-test-123",
+            })
+            self.module.start_shift_goal(message)
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.SHEET_ID = original_sheet_id
+
+        self.assertEqual(user["pending_goal"]["capture"], capture)
+
+    def test_active_shift_capture_has_priority_over_restored_next_capture_for_goal(self):
+        message = self.message()
+        next_capture = {
+            "capture_id": "capture-next",
+            "name": "Наступна",
+            "project": "Well Place 2",
+        }
+        current_capture = {
+            "capture_id": "capture-current",
+            "name": "Поточна",
+            "project": "Well Place 2",
+        }
+        spreadsheet = self.selected_capture_spreadsheet(next_capture)
+        original_get_sheet = self.module.get_sheet
+        original_sheet_id = self.module.SHEET_ID
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.SHEET_ID = "test-sheet"
+        try:
+            user = self.module.get_user(message.from_user.id, "Іван Петренко")
+            user.update({
+                "shift_started": True,
+                "shift_start_time": self.module.datetime(
+                    2026, 9, 26, 8, 0, tzinfo=self.module.KYIV_TZ
+                ),
+                "shift_capture": current_capture,
+                "shift_id": "shift-test-123",
+            })
+            self.module.start_shift_goal(message)
+        finally:
+            self.module.get_sheet = original_get_sheet
+            self.module.SHEET_ID = original_sheet_id
+
+        self.assertEqual(user["selected_capture"], next_capture)
+        self.assertEqual(user["pending_goal"]["capture"], current_capture)
+
     def test_goal_navigation_exact_labels_units_numeric_and_back(self):
         message = self.message(self.module.SHIFT_GOAL_TEXT)
         self.active_shift_user(message)
@@ -537,6 +764,11 @@ class BotEventsTests(unittest.TestCase):
                     ("Обробка гідрофобом", "м²"),
                 ],
             },
+            "🧹 Прибирання": {
+                "": [
+                    ("Прибирання робочої зони", "год."),
+                ],
+            },
         })
 
     def test_multiple_personal_goals_are_saved_for_one_shift(self):
@@ -607,6 +839,117 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(set(row[10].split(";")), {"123", "456"})
         self.assertEqual(row[12], "123")
         self.assertEqual(row[16:19], ["Нанесення баранника", "м²", 40.0])
+
+    def test_personal_cleanup_goal_skips_empty_stage_goes_back_and_saves_once(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        user = self.active_shift_user(message)
+        goal_sheet = self.goal_sheet()
+        spreadsheet = FakeSpreadsheet([goal_sheet])
+        cleanup_index = list(self.module.GOAL_PROCESS_TREE).index("🧹 Прибирання")
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            self.module.start_shift_goal(message)
+            self.module.handle_goal_callback(self.callback(message, "g:type:personal"))
+            process_rows = self.module.bot.edited[-1][1]["reply_markup"].rows
+            self.assertIn("🧹 Прибирання", [button for row in process_rows for button in row])
+
+            self.module.handle_goal_callback(
+                self.callback(message, f"g:process:{cleanup_index}")
+            )
+            pending = user["pending_goal"]
+            self.assertEqual(pending["stage"], "subprocess")
+            self.assertEqual(pending["category"], "")
+            self.assertEqual(
+                self.module.bot.edited[-1][1]["reply_markup"].rows,
+                [["Прибирання робочої зони"], [self.module.GOAL_BACK_TEXT]],
+            )
+
+            self.module.handle_goal_callback(self.callback(message, "g:back"))
+            self.assertEqual(pending["stage"], "process")
+            self.module.handle_goal_callback(
+                self.callback(message, f"g:process:{cleanup_index}")
+            )
+            self.module.handle_goal_callback(self.callback(message, "g:subprocess:0"))
+            self.assertEqual(pending["unit"], "год.")
+            self.module.handle_goal_callback(self.callback(message, "g:back"))
+            self.assertEqual(pending["stage"], "subprocess")
+            self.module.handle_goal_callback(self.callback(message, "g:subprocess:0"))
+            self.assertTrue(self.module.handle_goal_text(message, "2,5"))
+            self.assertIn("План: 2,5 год.", self.module.bot.edited[-1][0])
+
+            self.module.handle_goal_callback(self.callback(message, "g:save"))
+            self.module.handle_goal_callback(self.callback(message, "g:save"))
+            self.module.handle_goal_callback(self.callback(message, "g:done"))
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(len(goal_sheet.appended), 1)
+        row, _ = goal_sheet.appended[0]
+        self.assertEqual(row[7], "Особиста")
+        self.assertEqual(row[14:19], [
+            "🧹 Прибирання", "", "Прибирання робочої зони", "год.", 2.5,
+        ])
+        self.assertIsNone(user["pending_goal"])
+
+    def test_team_cleanup_goal_skips_empty_stage_goes_back_and_saves_once(self):
+        message = self.message(self.module.SHIFT_GOAL_TEXT)
+        user = self.active_shift_user(message)
+        workers = FakeWorksheet(
+            "Працівники",
+            headers=["telegram_user_id", "ПІБ", "роль", "бригада", "active"],
+            records=[
+                {
+                    "telegram_user_id": "123", "ПІБ": "Іван Петренко",
+                    "роль": "Майстер", "бригада": "Резуненко", "active": "TRUE",
+                },
+                {
+                    "telegram_user_id": "456", "ПІБ": "Роман Коваль",
+                    "роль": "Майстер", "бригада": "Резуненко", "active": "TRUE",
+                },
+            ],
+        )
+        goal_sheet = self.goal_sheet()
+        spreadsheet = FakeSpreadsheet([workers, goal_sheet])
+        cleanup_index = list(self.module.GOAL_PROCESS_TREE).index("🧹 Прибирання")
+        original_get_sheet = self.module.get_sheet
+        self.module.get_sheet = lambda: spreadsheet
+        try:
+            self.module.start_shift_goal(message)
+            self.module.handle_goal_callback(self.callback(message, "g:type:team"))
+            self.module.handle_goal_callback(self.callback(message, "g:team:1"))
+            self.module.handle_goal_callback(self.callback(message, "g:team:done"))
+            self.module.handle_goal_callback(
+                self.callback(message, f"g:process:{cleanup_index}")
+            )
+            pending = user["pending_goal"]
+            self.assertEqual(pending["stage"], "subprocess")
+            self.assertEqual(pending["category"], "")
+
+            self.module.handle_goal_callback(self.callback(message, "g:back"))
+            self.assertEqual(pending["stage"], "process")
+            self.module.handle_goal_callback(
+                self.callback(message, f"g:process:{cleanup_index}")
+            )
+            self.module.handle_goal_callback(self.callback(message, "g:subprocess:0"))
+            self.assertTrue(self.module.handle_goal_text(message, "3"))
+            self.assertIn("Тип: Командна", self.module.bot.edited[-1][0])
+            self.assertIn("План: 3 год.", self.module.bot.edited[-1][0])
+
+            self.module.handle_goal_callback(self.callback(message, "g:save"))
+            self.module.handle_goal_callback(self.callback(message, "g:save"))
+            self.module.handle_goal_callback(self.callback(message, "g:done"))
+        finally:
+            self.module.get_sheet = original_get_sheet
+
+        self.assertEqual(len(goal_sheet.appended), 1)
+        row, _ = goal_sheet.appended[0]
+        self.assertEqual(row[7], "Командна")
+        self.assertEqual(set(row[10].split(";")), {"123", "456"})
+        self.assertEqual(row[14:19], [
+            "🧹 Прибирання", "", "Прибирання робочої зони", "год.", 3.0,
+        ])
+        self.assertIsNone(user["pending_goal"])
 
     def test_my_status_shows_capture_shared_progress_without_double_counting(self):
         message = self.message(self.module.EVENTS_STATUS_TEXT)
@@ -759,7 +1102,136 @@ class BotEventsTests(unittest.TestCase):
             ],
         )
 
-    def test_material_issue_selects_capture_confirms_and_saves_it(self):
+    def test_material_issue_reuses_active_shift_capture_and_saves_it(self):
+        message = self.materials_topic_message(self.module.MATERIALS_TEXT)
+        current_capture = {
+            "capture_id": "capture-current",
+            "name": "3 верх",
+            "project": "Well Place",
+        }
+        next_capture = {
+            "capture_id": "capture-next",
+            "name": "4 низ",
+            "project": "Well Place",
+        }
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = current_capture
+        actor["selected_capture"] = next_capture
+        actor["shift_id"] = "shift-current-1"
+
+        originals = {
+            "get_material_catalog": self.module.get_material_catalog,
+            "find_material_candidates": self.module.find_material_candidates,
+            "interpret_material_with_ai": self.module.interpret_material_with_ai,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        self.module.get_material_catalog = lambda: [material]
+        self.module.find_material_candidates = lambda text: [material]
+        self.module.interpret_material_with_ai = lambda text, catalog: None
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+
+        try:
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["kind"], "issue_input")
+            self.assertEqual(actor["pending_material"]["capture"], current_capture)
+            self.assertIn("Захватка: 3 верх", self.module.bot.sent[-1][1])
+
+            message.text = "Клей фасадний 2"
+            self.module.handle_text(message)
+            self.assertEqual(actor["pending_material"]["capture"], current_capture)
+            self.assertEqual(actor["pending_material"]["shift_id"], "shift-current-1")
+
+            actor["shift_capture"] = {
+                "capture_id": "capture-changed",
+                "name": "9 верх",
+                "project": "Other Place",
+            }
+            actor["shift_id"] = "shift-changed"
+
+            message.text = self.module.MATERIAL_CONFIRM_TEXT
+            self.module.handle_text(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        appended_values, _ = log_sheet.appended[0]
+        self.assertEqual(appended_values[5], "3 верх")
+        self.assertEqual(len(appended_values), len(self.module.MATERIAL_LOG_HEADERS))
+        self.assertEqual(
+            appended_values[-3:],
+            ["capture-current", "Well Place", "shift-current-1"],
+        )
+        self.assertIn("Захватка: 3 верх", self.module.bot.sent[-1][1])
+
+    def test_material_capture_uses_selected_capture_before_shift_starts(self):
+        user = self.module.get_user(123, "Іван Петренко")
+        user["selected_capture"] = {
+            "capture_id": "capture-next",
+            "name": "4 низ",
+            "project": "Well Place",
+        }
+
+        self.assertEqual(self.module.current_work_capture(user)["name"], "4 низ")
+
+    def test_material_write_entrypoints_are_serialized_within_one_bot_process(self):
+        for function_name in (
+            "save_material_operation",
+            "save_inventory_record",
+            "save_defect_report",
+            "save_invoice_delivery",
+        ):
+            self.assertTrue(hasattr(getattr(self.module, function_name), "__wrapped__"))
+
+        state_lock = threading.Lock()
+        start = threading.Event()
+        active = 0
+        max_active = 0
+
+        @self.module.serialized_material_write
+        def probe():
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+
+        threads = [
+            threading.Thread(target=lambda: (start.wait(), probe()))
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertEqual(max_active, 1)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_material_issue_uses_selected_capture_confirms_and_saves_it(self):
         message = self.materials_topic_message(self.module.MATERIALS_TEXT)
         capture = {
             "capture_id": "capture-2",
@@ -784,8 +1256,10 @@ class BotEventsTests(unittest.TestCase):
             tzinfo=self.module.KYIV_TZ,
         )
 
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["selected_capture"] = dict(capture)
+
         originals = {
-            "get_active_captures": self.module.get_active_captures,
             "get_material_catalog": self.module.get_material_catalog,
             "find_material_candidates": self.module.find_material_candidates,
             "interpret_material_with_ai": self.module.interpret_material_with_ai,
@@ -795,7 +1269,6 @@ class BotEventsTests(unittest.TestCase):
             "sync_daily_material_movement": self.module.sync_daily_material_movement,
             "now_dt": self.module.now_dt,
         }
-        self.module.get_active_captures = lambda: [capture]
         self.module.get_material_catalog = lambda: [material]
         self.module.find_material_candidates = lambda text: [material]
         self.module.interpret_material_with_ai = lambda text, catalog: None
@@ -812,15 +1285,6 @@ class BotEventsTests(unittest.TestCase):
         self.module.now_dt = lambda: fixed_now
 
         try:
-            self.module.handle_text(message)
-            actor = self.module.get_user(message.from_user.id, "Іван Петренко")
-            self.assertEqual(actor["pending_material"]["kind"], "issue_capture")
-            self.assertEqual(
-                self.module.bot.sent[-1][2]["reply_markup"].rows,
-                [["2 низ"], [self.module.MATERIAL_CANCEL_TEXT]],
-            )
-
-            message.text = "2 низ"
             self.module.handle_text(message)
             self.assertEqual(actor["pending_material"]["kind"], "issue_input")
             self.assertEqual(actor["pending_material"]["capture"], capture)
@@ -850,6 +1314,11 @@ class BotEventsTests(unittest.TestCase):
         appended_values, _ = log_sheet.appended[0]
         self.assertEqual(appended_values[5], "2 низ")
         self.assertEqual(self.module.MATERIAL_LOG_HEADERS[5], "Захватка")
+        self.assertEqual(
+            self.module.MATERIAL_LOG_HEADERS[-3:],
+            ["capture_id", "обʼєкт", "shift_id"],
+        )
+        self.assertEqual(appended_values[-3:], ["capture-2", "Well Place", ""])
         self.assertIn("Захватка: 2 низ", self.module.bot.sent[-1][1])
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
@@ -871,6 +1340,143 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
             self.module.materials_keyboard().rows,
+        )
+
+    def test_all_material_write_entrypoints_and_save_guards_require_capture(self):
+        message = self.materials_topic_message()
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["selected_capture_loaded"] = True
+
+        for text in (
+            self.module.MATERIALS_TEXT,
+            self.module.MATERIAL_ORDER_TEXT,
+            self.module.MATERIAL_RETURN_TEXT,
+            self.module.INVENTORY_TEXT,
+            self.module.DEFECT_TEXT,
+            "Клей фасадний 2",
+        ):
+            with self.subTest(text=text):
+                actor["pending_material"] = None
+                self.module.bot.sent.clear()
+                self.module.handle_materials_text(message, text)
+                self.assertIsNone(actor["pending_material"])
+                self.assertIn("Без захватки", self.module.bot.sent[-1][1])
+
+        guarded_pending = [
+            (
+                self.module.save_material_operation,
+                {
+                    "kind": "material",
+                    "operation": "Видача",
+                    "quantity": 1,
+                    "selected": {"Матеріал": "Клей"},
+                },
+            ),
+            (
+                self.module.save_inventory_record,
+                {
+                    "kind": "inventory",
+                    "quantity": 1,
+                    "selected": {"Матеріал": "Клей"},
+                },
+            ),
+            (
+                self.module.save_defect_report,
+                {
+                    "kind": "defect_confirm",
+                    "quantity": 1,
+                    "selected": {"Матеріал": "Клей"},
+                },
+            ),
+            (
+                self.module.save_invoice_delivery,
+                {"kind": "invoice", "invoice": {"items": []}},
+            ),
+        ]
+        for saver, pending in guarded_pending:
+            with self.subTest(saver=saver.__name__):
+                actor["pending_material"] = pending
+                self.module.bot.sent.clear()
+                saver(message)
+                self.assertIn("Без захватки", self.module.bot.sent[-1][1])
+
+    def test_direct_issue_and_return_keep_their_capture_snapshots(self):
+        message = self.materials_topic_message("Клей фасадний 2")
+        original_capture = {
+            "capture_id": "capture-direct",
+            "name": "3 верх",
+            "project": "Well Place",
+        }
+        changed_capture = {
+            "capture_id": "capture-changed",
+            "name": "8 низ",
+            "project": "Other Place",
+        }
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = dict(original_capture)
+        actor["shift_id"] = "shift-direct"
+
+        originals = {
+            "get_material_catalog": self.module.get_material_catalog,
+            "find_material_candidates": self.module.find_material_candidates,
+            "interpret_material_with_ai": self.module.interpret_material_with_ai,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        self.module.get_material_catalog = lambda: [material]
+        self.module.find_material_candidates = lambda text: [material]
+        self.module.interpret_material_with_ai = lambda text, catalog: None
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+
+        try:
+            self.module.handle_materials_text(message, message.text)
+            self.assertEqual(actor["pending_material"]["capture"], original_capture)
+            actor["shift_capture"] = dict(changed_capture)
+            actor["shift_id"] = "shift-changed"
+            self.module.save_material_operation(message)
+
+            actor["shift_capture"] = dict(original_capture)
+            actor["shift_id"] = "shift-return"
+            self.module.handle_materials_text(message, self.module.MATERIAL_RETURN_TEXT)
+            self.assertEqual(actor["pending_material"]["capture"], original_capture)
+            actor["shift_capture"] = dict(changed_capture)
+            actor["shift_id"] = "shift-changed-again"
+            self.module.handle_materials_text(message, "Клей фасадний 3")
+            self.assertEqual(actor["pending_material"]["operation"], "Повернення")
+            self.module.save_material_operation(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        self.assertEqual(len(log_sheet.appended), 2)
+        issue_row = log_sheet.appended[0][0]
+        return_row = log_sheet.appended[1][0]
+        self.assertEqual(issue_row[1], "Видача")
+        self.assertEqual(issue_row[-3:], ["capture-direct", "Well Place", "shift-direct"])
+        self.assertEqual(return_row[1], "Повернення")
+        self.assertEqual(return_row[-3:], ["capture-direct", "Well Place", "shift-return"])
+        self.assertTrue(
+            all(len(row) == len(self.module.MATERIAL_LOG_HEADERS) for row, _ in log_sheet.appended)
         )
 
     def test_material_order_keeps_order_mode_confirms_and_saves_it(self):
@@ -899,8 +1505,11 @@ class BotEventsTests(unittest.TestCase):
         )
         movement_calls = []
 
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["selected_capture"] = dict(capture)
+        actor["shift_id"] = "shift-order-1"
+
         originals = {
-            "get_active_captures": self.module.get_active_captures,
             "get_material_catalog": self.module.get_material_catalog,
             "find_material_candidates": self.module.find_material_candidates,
             "interpret_material_with_ai": self.module.interpret_material_with_ai,
@@ -910,7 +1519,6 @@ class BotEventsTests(unittest.TestCase):
             "sync_daily_material_movement": self.module.sync_daily_material_movement,
             "now_dt": self.module.now_dt,
         }
-        self.module.get_active_captures = lambda: [capture]
         self.module.get_material_catalog = lambda: [material]
         self.module.find_material_candidates = lambda text: [material]
         self.module.interpret_material_with_ai = lambda text, catalog: None
@@ -930,13 +1538,6 @@ class BotEventsTests(unittest.TestCase):
 
         try:
             self.module.handle_text(message)
-            actor = self.module.get_user(message.from_user.id, "Іван Петренко")
-            self.assertEqual(actor["pending_material"]["kind"], "issue_capture")
-            self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
-            self.assertIn("замовляємо матеріал", self.module.bot.sent[-1][1])
-
-            message.text = "5 Велика"
-            self.module.handle_text(message)
             self.assertEqual(actor["pending_material"]["kind"], "issue_input")
             self.assertEqual(actor["pending_material"]["operation"], "Замовлення")
             self.assertEqual(actor["pending_material"]["capture"], capture)
@@ -944,6 +1545,13 @@ class BotEventsTests(unittest.TestCase):
                 "Який матеріал замовляємо та яка кількість?",
                 self.module.bot.sent[-1][1],
             )
+
+            actor["selected_capture"] = {
+                "capture_id": "capture-new",
+                "name": "6 Мала",
+                "project": "Other Place",
+            }
+            actor["shift_id"] = "shift-order-new"
 
             message.text = "Клей фасадний"
             self.module.handle_text(message)
@@ -980,6 +1588,10 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(appended_values[4], "міш.")
         self.assertEqual(appended_values[5], "5 Велика")
         self.assertEqual(
+            appended_values[-3:],
+            ["capture-5", "Well Place", "shift-order-1"],
+        )
+        self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,
             self.module.materials_keyboard().rows,
         )
@@ -1001,6 +1613,229 @@ class BotEventsTests(unittest.TestCase):
             self.module.bot.sent[-1][2]["reply_markup"].rows,
             self.module.materials_keyboard().rows,
         )
+
+    def test_inventory_uses_start_snapshot_and_writes_aligned_context_columns(self):
+        message = self.materials_topic_message(self.module.INVENTORY_TEXT)
+        original_capture = {
+            "capture_id": "capture-inventory",
+            "name": "2 низ",
+            "project": "Well Place",
+        }
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = dict(original_capture)
+        actor["shift_id"] = "shift-inventory"
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        movement_sheet = FakeWorksheet(self.module.DAILY_MATERIAL_SHEET)
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([movement_sheet, log_sheet])
+        movement_calls = []
+        originals = {
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_book_material_balance": self.module.get_book_material_balance,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_book_material_balance = lambda worksheet, selected: 10
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = (
+            lambda *args, **kwargs: movement_calls.append((args, kwargs))
+        )
+
+        try:
+            self.module.start_inventory(message, message.text)
+            self.assertEqual(actor["pending_material"]["capture"], original_capture)
+            actor["shift_capture"] = {
+                "capture_id": "capture-new",
+                "name": "7 верх",
+                "project": "Other Place",
+            }
+            actor["shift_id"] = "shift-new"
+            actor["pending_material"].update({
+                "kind": "inventory",
+                "selected": material,
+                "quantity": 7,
+            })
+            self.module.save_inventory_record(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        self.assertEqual(len(movement_calls), 1)
+        row = log_sheet.appended[0][0]
+        self.assertEqual(len(row), len(self.module.MATERIAL_LOG_HEADERS))
+        self.assertEqual(row[10], str(message.chat.id))
+        self.assertEqual(row[-3:], ["capture-inventory", "Well Place", "shift-inventory"])
+
+    def test_defect_uses_start_snapshot_in_both_records(self):
+        message = self.materials_topic_message(self.module.DEFECT_TEXT)
+        original_capture = {
+            "capture_id": "capture-defect",
+            "name": "4 верх",
+            "project": "Well Place",
+        }
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = dict(original_capture)
+        actor["shift_id"] = "shift-defect"
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        defect_sheet = FakeWorksheet("Дефектні акти", headers=self.module.DEFECT_HEADERS)
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([defect_sheet, log_sheet])
+        originals = {
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: spreadsheet.worksheet(title)
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+
+        try:
+            self.module.start_defect_report(message)
+            self.assertEqual(actor["pending_material"]["capture"], original_capture)
+            actor["shift_capture"] = {
+                "capture_id": "capture-new",
+                "name": "9 низ",
+                "project": "Other Place",
+            }
+            actor["shift_id"] = "shift-new"
+            actor["pending_material"].update({
+                "kind": "defect_confirm",
+                "selected": material,
+                "quantity": 2,
+                "photo_file_id": "photo-1",
+                "photo_message_id": "333",
+                "description": "пошкоджено",
+            })
+            self.module.save_defect_report(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        self.assertEqual(defect_sheet.appended[0][0][5], "4 верх")
+        log_row = log_sheet.appended[0][0]
+        self.assertEqual(len(log_row), len(self.module.MATERIAL_LOG_HEADERS))
+        self.assertEqual(log_row[-3:], ["capture-defect", "Well Place", "shift-defect"])
+
+    def test_delegated_issue_uses_only_target_capture_and_blocks_missing_target_capture(self):
+        message = self.materials_topic_message()
+        worker = {
+            "telegram_user_id": "456",
+            "name": "Роман Коваль",
+            "role": "Майстер",
+        }
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = {
+            "capture_id": "capture-actor",
+            "name": "Захватка автора",
+            "project": "Actor Project",
+        }
+        actor["shift_id"] = "shift-actor"
+        target = self.module.get_user(worker["telegram_user_id"], worker["name"])
+        target["selected_capture_loaded"] = True
+        chat_id, thread_id = self.module.message_context(message)
+        actor["pending_delegate"] = {
+            "kind": "material",
+            "stage": "worker",
+            "workers": [worker],
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+
+        self.module.handle_delegate_text(message, self.module.worker_button_text(worker))
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertIsNone(actor["pending_delegate"])
+        self.assertIn("Роман Коваль", self.module.bot.sent[-1][1])
+        self.assertIn("не обрано захватку", self.module.bot.sent[-1][1])
+
+        target_capture = {
+            "capture_id": "capture-target",
+            "name": "Захватка працівника",
+            "project": "Target Project",
+        }
+        target["shift_capture"] = dict(target_capture)
+        target["shift_id"] = "shift-target"
+        actor["pending_delegate"] = {
+            "kind": "material",
+            "stage": "worker",
+            "workers": [worker],
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        originals = {
+            "get_material_catalog": self.module.get_material_catalog,
+            "find_material_candidates": self.module.find_material_candidates,
+            "interpret_material_with_ai": self.module.interpret_material_with_ai,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        self.module.get_material_catalog = lambda: [material]
+        self.module.find_material_candidates = lambda text: [material]
+        self.module.interpret_material_with_ai = lambda text, catalog: None
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+
+        try:
+            self.module.handle_delegate_text(message, self.module.worker_button_text(worker))
+            self.assertEqual(actor["pending_material"]["capture"], target_capture)
+            target["shift_capture"] = {
+                "capture_id": "capture-target-new",
+                "name": "Нова захватка працівника",
+                "project": "Other Project",
+            }
+            target["shift_id"] = "shift-target-new"
+            self.module.handle_delegate_text(message, "Клей фасадний 5")
+            self.assertEqual(actor["pending_material"]["capture"], target_capture)
+            self.module.save_material_operation(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+
+        row = log_sheet.appended[0][0]
+        self.assertEqual(row[6], "Роман Коваль")
+        self.assertEqual(row[-3:], ["capture-target", "Target Project", "shift-target"])
 
     def test_order_sync_updates_only_the_material_order_column(self):
         class Cell:
@@ -1100,6 +1935,104 @@ class BotEventsTests(unittest.TestCase):
 
         self.assertEqual(candidates, [foam_50])
 
+    def test_invoice_photo_requires_capture_before_recognition(self):
+        message = self.materials_topic_message()
+        message.photo = [types.SimpleNamespace(file_id="invoice-photo")]
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["selected_capture_loaded"] = True
+        original_key = self.module.OPENAI_API_KEY
+        self.module.OPENAI_API_KEY = "test-openai-key"
+        try:
+            self.module.handle_invoice_photo(message)
+        finally:
+            self.module.OPENAI_API_KEY = original_key
+
+        self.assertIsNone(actor["pending_material"])
+        self.assertIn("Без захватки", self.module.bot.sent[-1][1])
+
+    def test_invoice_photo_keeps_capture_snapshot_until_save(self):
+        message = self.materials_topic_message()
+        message.photo = [types.SimpleNamespace(file_id="invoice-photo")]
+        original_capture = {
+            "capture_id": "capture-invoice-start",
+            "name": "Зона приймання",
+            "project": "Well Place",
+        }
+        actor = self.module.get_user(message.from_user.id, "Іван Петренко")
+        actor["shift_capture"] = dict(original_capture)
+        actor["shift_id"] = "shift-invoice-start"
+        material = {
+            "Матеріал": "Клей фасадний",
+            "Од. виміру / примітка": "міш.",
+        }
+        invoice = {
+            "supplier": "Постачальник",
+            "invoice_number": "N-1",
+            "invoice_date": "26.09.2026",
+            "items": [{"material": material, "quantity": 10, "unit": "міш."}],
+            "unmatched": [],
+        }
+        log_sheet = FakeWorksheet(
+            "Операції матеріалів",
+            headers=self.module.MATERIAL_LOG_HEADERS,
+        )
+        spreadsheet = FakeSpreadsheet([log_sheet])
+        originals = {
+            "OPENAI_API_KEY": self.module.OPENAI_API_KEY,
+            "get_material_catalog": self.module.get_material_catalog,
+            "interpret_invoice_photo_with_ai": self.module.interpret_invoice_photo_with_ai,
+            "get_worker": self.module.get_worker,
+            "get_sheet": self.module.get_sheet,
+            "get_or_create_worksheet": self.module.get_or_create_worksheet,
+            "sync_daily_material_movement": self.module.sync_daily_material_movement,
+        }
+        original_get_file = getattr(self.module.bot, "get_file", None)
+        original_download_file = getattr(self.module.bot, "download_file", None)
+        self.module.OPENAI_API_KEY = "test-openai-key"
+        self.module.bot.get_file = lambda file_id: types.SimpleNamespace(file_path="invoice.jpg")
+        self.module.bot.download_file = lambda file_path: b"image"
+        self.module.get_material_catalog = lambda: [material]
+        self.module.interpret_invoice_photo_with_ai = lambda image, catalog: invoice
+        self.module.get_worker = lambda user_id: {
+            "telegram_user_id": str(user_id),
+            "name": "Іван Петренко",
+            "role": "Майстер",
+        }
+        self.module.get_sheet = lambda: spreadsheet
+        self.module.get_or_create_worksheet = (
+            lambda current_spreadsheet, title, headers: log_sheet
+        )
+        self.module.sync_daily_material_movement = lambda *args, **kwargs: None
+
+        try:
+            self.module.handle_invoice_photo(message)
+            self.assertEqual(actor["pending_material"]["capture"], original_capture)
+            actor["shift_capture"] = {
+                "capture_id": "capture-new",
+                "name": "Інша зона",
+                "project": "Other Place",
+            }
+            actor["shift_id"] = "shift-new"
+            self.module.save_invoice_delivery(message)
+        finally:
+            for name, value in originals.items():
+                setattr(self.module, name, value)
+            if original_get_file is None:
+                delattr(self.module.bot, "get_file")
+            else:
+                self.module.bot.get_file = original_get_file
+            if original_download_file is None:
+                delattr(self.module.bot, "download_file")
+            else:
+                self.module.bot.download_file = original_download_file
+
+        row = log_sheet.appended[0][0]
+        self.assertEqual(len(row), len(self.module.MATERIAL_LOG_HEADERS))
+        self.assertEqual(
+            row[-3:],
+            ["capture-invoice-start", "Well Place", "shift-invoice-start"],
+        )
+
     def test_invoice_foam_cubic_quantity_is_saved_as_square_metres(self):
         material = {
             "Матеріал": "Пінопласт 50 мм",
@@ -1181,7 +2114,16 @@ class BotEventsTests(unittest.TestCase):
 
             message = self.materials_topic_message(self.module.INVOICE_CONFIRM_TEXT)
             actor = self.module.get_user(message.from_user.id, "Іван Петренко")
-            actor["pending_material"] = {"kind": "invoice", "invoice": invoice}
+            actor["pending_material"] = {
+                "kind": "invoice",
+                "invoice": invoice,
+                "capture": {
+                    "capture_id": "capture-invoice",
+                    "name": "Складська зона",
+                    "project": "Well Place",
+                },
+                "shift_id": "shift-invoice-1",
+            }
             self.module.handle_text(message)
         finally:
             self.module.OPENAI_API_KEY = originals["OPENAI_API_KEY"]
@@ -1211,6 +2153,11 @@ class BotEventsTests(unittest.TestCase):
         self.assertIn(
             "Перерахунок: 6.18 м³ → 123.6 м.кв.; товщина 50 мм",
             appended_values[8],
+        )
+        self.assertEqual(len(appended_values), len(self.module.MATERIAL_LOG_HEADERS))
+        self.assertEqual(
+            appended_values[-3:],
+            ["capture-invoice", "Well Place", "shift-invoice-1"],
         )
         self.assertEqual(
             self.module.bot.sent[-1][2]["reply_markup"].rows,

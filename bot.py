@@ -7,6 +7,7 @@ load_dotenv()
 import json
 import re
 import base64
+from functools import wraps
 import threading
 import time
 import urllib.error
@@ -69,6 +70,17 @@ bot = telebot.TeleBot(TOKEN)
 BOT_INFO = bot.get_me()
 BOT_USERNAME = BOT_INFO.username
 BOT_ID = BOT_INFO.id
+MATERIAL_WRITE_LOCK = threading.RLock()
+
+
+def serialized_material_write(function):
+    """Keep stock read-modify-write sequences ordered inside one bot process."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with MATERIAL_WRITE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
 
 DIALOG_GOAL_TEXT = (
     "Моя задача — допомогти підготувати дані для акту приймання-передачі виконаних робіт.\n"
@@ -231,7 +243,7 @@ def get_or_create_worksheet(spreadsheet, title, headers):
     if current_cols < len(headers):
         worksheet.add_cols(len(headers) - current_cols)
 
-    worksheet.update("A1", [headers])
+    worksheet.update(range_name="A1", values=[headers])
 
     return worksheet
 
@@ -283,7 +295,7 @@ def get_or_create_objects_worksheet(spreadsheet):
         )
         values = [OBJECTS_HEADERS]
         values.extend([[name, "TRUE"] for name in get_capture_objects(spreadsheet)])
-        worksheet.update("A1", values)
+        worksheet.update(range_name="A1", values=values)
         return worksheet
 
 
@@ -685,7 +697,7 @@ def save_shift_to_sheet(
     spreadsheet = get_sheet()
     worksheet = spreadsheet.worksheet("Зміни")
     if worksheet.row_values(1) != SHIFT_HEADERS:
-        worksheet.update("A1", [SHIFT_HEADERS])
+        worksheet.update(range_name="A1", values=[SHIFT_HEADERS])
 
     worksheet.append_row([
         shift_end.strftime("%d.%m.%Y"),
@@ -704,6 +716,81 @@ def save_shift_to_sheet(
         str(chat_id),
         format_datetime(now_dt()),
     ])
+
+
+WORKER_CAPTURE_ID_COLUMN = 9
+WORKER_CAPTURE_NAME_COLUMN = 10
+WORKER_CAPTURE_PROJECT_COLUMN = 11
+
+
+def find_worker_sheet_row(worksheet, user_id):
+    values = worksheet.get_all_values()
+    if not values:
+        return None, None
+
+    headers = values[0]
+    user_id_column = next(
+        (
+            index
+            for index, header in enumerate(headers)
+            if normalize_sheet_header(header)
+            in {"telegram user id", "telegram id", "user id"}
+        ),
+        None,
+    )
+    if user_id_column is None:
+        user_id_column = next(
+            (
+                index
+                for index, header in enumerate(headers)
+                if normalize_sheet_header(header) == ""
+            ),
+            None,
+        )
+    if user_id_column is None:
+        raise ValueError("У вкладці «Працівники» немає колонки telegram_user_id.")
+
+    expected_user_id = str(user_id).strip()
+    for row_number, row in enumerate(values[1:], start=2):
+        row_user_id = str(row[user_id_column] if user_id_column < len(row) else "").strip()
+        if row_user_id == expected_user_id:
+            return row_number, row
+    return None, None
+
+
+def load_selected_capture(user_id):
+    worksheet = get_sheet().worksheet("Працівники")
+    _, row = find_worker_sheet_row(worksheet, user_id)
+    if row is None:
+        return None
+
+    padded = list(row) + [""] * max(0, WORKER_CAPTURE_PROJECT_COLUMN - len(row))
+    capture_id = str(padded[WORKER_CAPTURE_ID_COLUMN - 1] or "").strip()
+    capture_name = str(padded[WORKER_CAPTURE_NAME_COLUMN - 1] or "").strip()
+    capture_project = str(padded[WORKER_CAPTURE_PROJECT_COLUMN - 1] or "").strip()
+    if not capture_name:
+        return None
+    return {
+        "capture_id": capture_id,
+        "name": capture_name,
+        "project": capture_project,
+    }
+
+
+def persist_selected_capture(user_id, capture):
+    worksheet = get_sheet().worksheet("Працівники")
+    row_number, _ = find_worker_sheet_row(worksheet, user_id)
+    if row_number is None:
+        raise ValueError("Працівника з таким Telegram ID не знайдено у вкладці «Працівники».")
+
+    worksheet.update(
+        range_name=f"I{row_number}:K{row_number}",
+        values=[[
+            str(capture.get("capture_id", "")).strip(),
+            str(capture.get("name", "")).strip(),
+            str(capture.get("project", "")).strip(),
+        ]],
+    )
 
 
 def get_worker(user_id):
@@ -868,7 +955,7 @@ EVENT_FIELD_ALIASES = {
 MATERIAL_LOG_HEADERS = [
     "дата", "операція", "матеріал", "кількість", "од. виміру",
     "Захватка", "працівник", "роль", "примітка", "telegram_user_id",
-    "telegram_chat_id", "timestamp",
+    "telegram_chat_id", "timestamp", "capture_id", "обʼєкт", "shift_id",
 ]
 
 MATERIAL_BALANCE_HEADERS = [
@@ -967,6 +1054,11 @@ GOAL_PROCESS_TREE = {
             ("Приклеювання листів", "м²"),
             ("Фугування", "м²"),
             ("Обробка гідрофобом", "м²"),
+        ],
+    },
+    "🧹 Прибирання": {
+        "": [
+            ("Прибирання робочої зони", "год."),
         ],
     },
 }
@@ -1289,11 +1381,30 @@ def get_user_name(message):
     return full_name
 
 
+def restore_selected_capture(user_id, user):
+    if user.get("selected_capture"):
+        user["selected_capture_loaded"] = True
+        return user["selected_capture"]
+    if user.get("selected_capture_loaded") or not SHEET_ID:
+        return None
+
+    try:
+        capture = load_selected_capture(user_id)
+    except Exception as error:
+        print(f"Selected capture restoration failed: {error}")
+        return None
+
+    user["selected_capture_loaded"] = True
+    if capture:
+        user["selected_capture"] = capture
+    return capture
+
+
 def get_user(user_id, full_name):
     user_key = str(user_id)
-    return users.setdefault(
-        user_key,
-        {
+    user = users.get(user_key)
+    if user is None:
+        user = {
             "full_name": full_name,
             "shift_started": False,
             "shift_start_time": None,
@@ -1315,8 +1426,11 @@ def get_user(user_id, full_name):
             "pending_shift_close": None,
             "pending_calculation": None,
             "calculations_context": None,
-        },
-    )
+            "selected_capture_loaded": False,
+        }
+        users[user_key] = user
+    restore_selected_capture(user_id, user)
+    return user
 
 
 def send_with_markup(message, text, markup):
@@ -1387,8 +1501,13 @@ def paired_inline_rows(items):
     return [items[index:index + 2] for index in range(0, len(items), 2)]
 
 
+def current_work_capture(user):
+    """Return the capture that should receive current work records."""
+    return user.get("shift_capture") or user.get("selected_capture")
+
+
 def current_goal_capture(user):
-    return user.get("selected_capture") or user.get("shift_capture")
+    return current_work_capture(user)
 
 
 def ensure_shift_id(user):
@@ -1602,14 +1721,14 @@ def get_shift_goals_worksheet():
             rows=1000,
             cols=len(SHIFT_GOAL_HEADERS),
         )
-        worksheet.update("A1", [SHIFT_GOAL_HEADERS])
+        worksheet.update(range_name="A1", values=[SHIFT_GOAL_HEADERS])
         return worksheet
 
     headers = worksheet.row_values(1)
     if not headers:
         if worksheet.col_count < len(SHIFT_GOAL_HEADERS):
             worksheet.add_cols(len(SHIFT_GOAL_HEADERS) - worksheet.col_count)
-        worksheet.update("A1", [SHIFT_GOAL_HEADERS])
+        worksheet.update(range_name="A1", values=[SHIFT_GOAL_HEADERS])
         return worksheet
     if [normalize_sheet_header(value) for value in headers[:len(SHIFT_GOAL_HEADERS)]] != [
         normalize_sheet_header(value) for value in SHIFT_GOAL_HEADERS
@@ -1868,7 +1987,7 @@ def handle_goal_callback(call):
         elif data.startswith("g:process:"):
             pending["process"] = list(GOAL_PROCESS_TREE)[int(data.rsplit(":", 1)[-1])]
             categories = list(GOAL_PROCESS_TREE[pending["process"]])
-            if pending["process"] == "🧱 Клінкер":
+            if categories == [""]:
                 pending["category"] = categories[0]
                 pending["stage"] = "subprocess"
             else:
@@ -1890,7 +2009,8 @@ def handle_goal_callback(call):
             elif stage == "category":
                 pending["stage"] = "process"
             elif stage == "subprocess":
-                pending["stage"] = "process" if pending.get("process") == "🧱 Клінкер" else "category"
+                categories = list(GOAL_PROCESS_TREE[pending["process"]])
+                pending["stage"] = "process" if categories == [""] else "category"
             elif stage == "quantity":
                 pending["stage"] = "subprocess"
         elif data == "g:edit":
@@ -2425,48 +2545,70 @@ def send_material_for_worker_prompt(message, worker, error_text=""):
     )
 
 
-def start_material_issue(message, error_text="", operation="Видача"):
-    try:
-        captures = get_active_captures()
-    except Exception as error:
-        print(f"Material capture selection failed: {error}")
-        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
-        send_with_keyboard(message, "Не вдалося отримати список захваток. Спробуйте ще раз пізніше.")
-        return
-
-    if not captures:
-        get_user(message.from_user.id, get_user_name(message))["pending_material"] = None
-        send_with_keyboard(message, "Немає активних захваток у таблиці «Захватки».")
-        return
-
-    user = get_user(message.from_user.id, get_user_name(message))
-    user["pending_material"] = {
-        "kind": "issue_capture",
-        "captures": captures,
-        "operation": operation,
+def snapshot_material_context(user):
+    """Freeze the capture and shift that a material write belongs to."""
+    capture = current_work_capture(user)
+    if not capture or not str(capture.get("name", "")).strip():
+        return None
+    return {
+        "capture": dict(capture),
+        "shift_id": str(user.get("shift_id") or ""),
     }
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    for capture in captures:
-        markup.row(KeyboardButton(capture["name"]))
-    markup.row(KeyboardButton(MATERIAL_CANCEL_TEXT))
-    prefix = f"{error_text}\n\n" if error_text else ""
-    capture_question = (
-        "Для якої захватки замовляємо матеріал?"
-        if operation == "Замовлення"
-        else "Для якої захватки беремо матеріал?"
-    )
-    send_with_markup(
-        message,
-        f"{prefix}{capture_question}",
-        markup,
-    )
 
 
-def send_material_issue_input_prompt(message, capture, error_text="", operation="Видача"):
+def send_material_capture_required(message, worker=None):
+    if worker:
+        text = (
+            f"У працівника «{worker['name']}» не обрано захватку. "
+            "Спочатку працівник має обрати її в меню «Події»."
+        )
+    else:
+        text = (
+            "Спочатку оберіть захватку в меню «Події». "
+            "Без захватки операцію з матеріалом не записано."
+        )
+    send_with_keyboard(message, text)
+
+
+def material_log_context_values(capture, shift_id):
+    return [
+        str(capture.get("capture_id", "")),
+        str(capture.get("project", "")),
+        str(shift_id or ""),
+    ]
+
+
+def start_material_issue(message, error_text="", operation="Видача"):
     user = get_user(message.from_user.id, get_user_name(message))
+    context = snapshot_material_context(user)
+    if not context:
+        user["pending_material"] = None
+        send_material_capture_required(message)
+        return
+
+    send_material_issue_input_prompt(
+        message,
+        context["capture"],
+        error_text,
+        operation=operation,
+        shift_id=context["shift_id"],
+    )
+
+
+def send_material_issue_input_prompt(
+    message,
+    capture,
+    error_text="",
+    operation="Видача",
+    shift_id=None,
+):
+    user = get_user(message.from_user.id, get_user_name(message))
+    if shift_id is None:
+        shift_id = str(user.get("shift_id") or "")
     user["pending_material"] = {
         "kind": "issue_input",
-        "capture": capture,
+        "capture": dict(capture),
+        "shift_id": str(shift_id or ""),
         "operation": operation,
     }
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -2513,7 +2655,17 @@ def select_capture(message, capture_name):
     user = get_user(message.from_user.id, get_user_name(message))
     for capture in get_active_captures():
         if capture["name"] == capture_name:
-            user["selected_capture"] = capture
+            try:
+                persist_selected_capture(message.from_user.id, capture)
+            except Exception as error:
+                print(f"Selected capture saving failed: {error}")
+                send_with_keyboard(
+                    message,
+                    "Не вдалося зберегти захватку за працівником. Спробуйте ще раз.",
+                )
+                return True
+            user["selected_capture"] = dict(capture)
+            user["selected_capture_loaded"] = True
             pending_goal = user.get("pending_goal") or {}
             if pending_goal.get("stage") == "waiting_capture" and user.get("shift_started"):
                 if not user.get("shift_capture"):
@@ -3065,9 +3217,31 @@ def interpret_invoice_photo_with_ai(image_bytes, catalog):
 def send_material_choice(message, text, forced_operation=None):
     user = get_user(message.from_user.id, get_user_name(message))
     current_pending = user.get("pending_material") or {}
-    capture = current_pending.get("capture")
-    operation = forced_operation or current_pending.get("operation") or "Видача"
     target_worker = user.get("material_for_worker")
+    context = None
+    if current_pending.get("capture"):
+        context = {
+            "capture": dict(current_pending["capture"]),
+            "shift_id": str(current_pending.get("shift_id") or ""),
+        }
+    elif target_worker:
+        target_user_id = str(target_worker.get("telegram_user_id") or "").strip()
+        if target_user_id:
+            target_user = get_user(
+                target_user_id,
+                target_worker.get("name") or target_user_id,
+            )
+            context = snapshot_material_context(target_user)
+    else:
+        context = snapshot_material_context(user)
+
+    if not context:
+        send_material_capture_required(message, target_worker)
+        return False
+
+    capture = context["capture"]
+    shift_id = context["shift_id"]
+    operation = forced_operation or current_pending.get("operation") or "Видача"
     quantity = extract_material_quantity(text)
     catalog = get_material_catalog()
     candidates = []
@@ -3091,6 +3265,7 @@ def send_material_choice(message, text, forced_operation=None):
                 capture,
                 error_text,
                 operation=operation,
+                shift_id=shift_id,
             )
         else:
             send_with_keyboard(
@@ -3109,6 +3284,7 @@ def send_material_choice(message, text, forced_operation=None):
                 capture,
                 error_text,
                 operation=operation,
+                shift_id=shift_id,
             )
         else:
             send_with_keyboard(message, error_text + " Або додамо для нього синонім.")
@@ -3121,7 +3297,8 @@ def send_material_choice(message, text, forced_operation=None):
         "candidates": candidates,
         "selected": None,
         "worker": target_worker,
-        "capture": capture,
+        "capture": dict(capture),
+        "shift_id": shift_id,
     }
     user["material_for_worker"] = None
 
@@ -3207,6 +3384,7 @@ def select_material_candidate(message, material_name):
     return True
 
 
+@serialized_material_write
 def save_material_operation(message):
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
@@ -3214,18 +3392,14 @@ def save_material_operation(message):
         send_with_keyboard(message, "Немає операції матеріалу для підтвердження.")
         return
 
+    capture = pending.get("capture")
+    if not capture or not str(capture.get("name", "")).strip():
+        send_material_capture_required(message, pending.get("worker"))
+        return
+
     material = pending["selected"]
     worker = pending.get("worker") or get_worker(message.from_user.id) or {}
-    target_user = get_user(
-        worker.get("telegram_user_id") or message.from_user.id,
-        worker.get("name") or user["full_name"],
-    )
-    capture = (
-        pending.get("capture")
-        or target_user.get("selected_capture")
-        or user.get("selected_capture")
-        or {}
-    )
+    shift_id = str(pending.get("shift_id") or "")
     spreadsheet = get_sheet()
     timestamp = now_dt()
     sync_daily_material_movement(
@@ -3251,6 +3425,7 @@ def save_material_operation(message):
         str(worker.get("telegram_user_id") or message.from_user.id),
         str(message.chat.id),
         format_datetime(timestamp),
+        *material_log_context_values(capture, shift_id),
     ])
 
     user["pending_material"] = None
@@ -3263,6 +3438,7 @@ def save_material_operation(message):
     )
 
 
+@serialized_material_write
 def save_inventory_record(message):
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
@@ -3270,9 +3446,14 @@ def save_inventory_record(message):
         send_with_keyboard(message, "Немає інвентаризації для підтвердження.")
         return
 
+    capture = pending.get("capture")
+    if not capture or not str(capture.get("name", "")).strip():
+        send_material_capture_required(message)
+        return
+
     material = pending["selected"]
     worker = get_worker(message.from_user.id) or {}
-    capture = user.get("selected_capture") or {}
+    shift_id = str(pending.get("shift_id") or "")
     timestamp = now_dt()
     spreadsheet = get_sheet()
     movement_sheet = spreadsheet.worksheet(DAILY_MATERIAL_SHEET)
@@ -3306,7 +3487,9 @@ def save_inventory_record(message):
         worker.get("role", ""),
         f"Облік: {book_balance:g}; фактично: {actual_balance:g}; коригування: {adjustment:+g}",
         str(message.from_user.id),
+        str(message.chat.id),
         format_datetime(timestamp),
+        *material_log_context_values(capture, shift_id),
     ])
     user["pending_material"] = None
     send_with_keyboard(
@@ -3319,10 +3502,17 @@ def save_inventory_record(message):
 
 def start_inventory(message, text):
     user = get_user(message.from_user.id, get_user_name(message))
+    context = snapshot_material_context(user)
+    if not context:
+        user["pending_material"] = None
+        send_material_capture_required(message)
+        return
     user["pending_material"] = {
         "kind": "inventory_material",
         "candidates": [],
         "selected": None,
+        "capture": context["capture"],
+        "shift_id": context["shift_id"],
     }
     send_with_keyboard(message, "Вкажіть матеріал для інвентаризації, наприклад: «малярний скотч».")
 
@@ -3401,7 +3591,17 @@ def send_defect_photo_prompt(message, pending, error_text=""):
 
 def start_defect_report(message):
     user = get_user(message.from_user.id, get_user_name(message))
-    user["pending_material"] = {"kind": "defect_input", "candidates": []}
+    context = snapshot_material_context(user)
+    if not context:
+        user["pending_material"] = None
+        send_material_capture_required(message)
+        return
+    user["pending_material"] = {
+        "kind": "defect_input",
+        "candidates": [],
+        "capture": context["capture"],
+        "shift_id": context["shift_id"],
+    }
     send_defect_material_prompt(message)
 
 
@@ -3473,6 +3673,7 @@ def handle_defect_photo(message, pending):
     )
 
 
+@serialized_material_write
 def save_defect_report(message):
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
@@ -3480,10 +3681,15 @@ def save_defect_report(message):
         send_with_keyboard(message, "Немає дефектного акта для підтвердження.")
         return
 
+    capture = pending.get("capture")
+    if not capture or not str(capture.get("name", "")).strip():
+        send_material_capture_required(message)
+        return
+
     material = pending["selected"]
     quantity = pending["quantity"]
     worker = get_worker(message.from_user.id) or {}
-    capture = user.get("selected_capture") or {}
+    shift_id = str(pending.get("shift_id") or "")
     timestamp = now_dt()
     act_number = f"DEF-{timestamp:%Y%m%d-%H%M%S}-{message.from_user.id}"
     spreadsheet = get_sheet()
@@ -3524,6 +3730,7 @@ def save_defect_report(message):
         str(message.from_user.id),
         str(message.chat.id),
         format_datetime(timestamp),
+        *material_log_context_values(capture, shift_id),
     ])
     user["pending_material"] = None
     send_with_keyboard(
@@ -3618,6 +3825,13 @@ def handle_invoice_photo(message):
         send_with_keyboard(message, "Розпізнавання накладних ще не налаштоване: потрібен ключ OpenAI API.")
         return
 
+    user = get_user(message.from_user.id, get_user_name(message))
+    context = snapshot_material_context(user)
+    if not context:
+        user["pending_material"] = None
+        send_material_capture_required(message)
+        return
+
     try:
         photo = message.photo[-1]
         file_info = bot.get_file(photo.file_id)
@@ -3641,11 +3855,16 @@ def handle_invoice_photo(message):
         )
         return
 
-    user = get_user(message.from_user.id, get_user_name(message))
-    user["pending_material"] = {"kind": "invoice", "invoice": invoice}
+    user["pending_material"] = {
+        "kind": "invoice",
+        "invoice": invoice,
+        "capture": context["capture"],
+        "shift_id": context["shift_id"],
+    }
     send_invoice_preview(message, invoice)
 
 
+@serialized_material_write
 def save_invoice_delivery(message):
     user = get_user(message.from_user.id, get_user_name(message))
     pending = user.get("pending_material")
@@ -3653,9 +3872,14 @@ def save_invoice_delivery(message):
         send_with_keyboard(message, "Немає накладної для підтвердження.")
         return
 
+    capture = pending.get("capture")
+    if not capture or not str(capture.get("name", "")).strip():
+        send_material_capture_required(message)
+        return
+
     invoice = pending["invoice"]
     worker = get_worker(message.from_user.id) or {}
-    capture = user.get("selected_capture") or {}
+    shift_id = str(pending.get("shift_id") or "")
     timestamp = now_dt()
     spreadsheet = get_sheet()
     note_parts = []
@@ -3701,6 +3925,7 @@ def save_invoice_delivery(message):
             str(message.from_user.id),
             str(message.chat.id),
             format_datetime(timestamp),
+            *material_log_context_values(capture, shift_id),
         ])
 
     user["pending_material"] = None
@@ -3855,8 +4080,28 @@ def handle_delegate_text(message, text):
             return True
         pending["worker"] = worker
         if pending["kind"] == "material":
+            target_user_id = str(worker.get("telegram_user_id") or "").strip()
+            context = None
+            if target_user_id:
+                target_user = get_user(
+                    target_user_id,
+                    worker.get("name") or target_user_id,
+                )
+                context = snapshot_material_context(target_user)
+            if not context:
+                actor["pending_delegate"] = None
+                actor["pending_material"] = None
+                actor["material_for_worker"] = None
+                send_material_capture_required(message, worker)
+                return True
             pending["stage"] = "material"
             actor["material_for_worker"] = worker
+            actor["pending_material"] = {
+                "kind": "issue_input",
+                "operation": "Видача",
+                "capture": context["capture"],
+                "shift_id": context["shift_id"],
+            }
             send_material_for_worker_prompt(message, worker)
             return True
 
@@ -5019,7 +5264,16 @@ def handle_materials_text(message, text):
 
     if text == MATERIAL_RETURN_TEXT:
         user = get_user(message.from_user.id, get_user_name(message))
-        user["pending_material"] = {"kind": "return_input"}
+        context = snapshot_material_context(user)
+        if not context:
+            user["pending_material"] = None
+            send_material_capture_required(message)
+            return
+        user["pending_material"] = {
+            "kind": "return_input",
+            "capture": context["capture"],
+            "shift_id": context["shift_id"],
+        }
         send_with_keyboard(
             message,
             "Напишіть матеріал і кількість, які повертаєте на склад. "
@@ -5063,7 +5317,12 @@ def handle_materials_text(message, text):
                 operation=operation,
             )
             return
-        send_material_issue_input_prompt(message, capture, operation=operation)
+        send_material_issue_input_prompt(
+            message,
+            capture,
+            operation=operation,
+            shift_id=pending.get("shift_id"),
+        )
         return
     if pending and pending.get("kind") == "issue_input":
         send_material_choice(
