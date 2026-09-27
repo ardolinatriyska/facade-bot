@@ -774,6 +774,38 @@ class BotEventsTests(unittest.TestCase):
             },
         })
 
+    def test_every_goal_tree_leaf_is_available_through_inline_buttons(self):
+        for process_index, (process, categories) in enumerate(
+            self.module.GOAL_PROCESS_TREE.items()
+        ):
+            for category_index, (category, subprocesses) in enumerate(categories.items()):
+                message = self.message(self.module.SHIFT_GOAL_TEXT)
+                self.active_shift_user(message)
+                self.module.start_shift_goal(message)
+                self.module.handle_goal_callback(self.callback(message, "g:type:personal"))
+                self.module.handle_goal_callback(
+                    self.callback(message, f"g:process:{process_index}")
+                )
+                if category:
+                    self.module.handle_goal_callback(
+                        self.callback(message, f"g:category:{category_index}")
+                    )
+
+                labels = [
+                    button
+                    for row in self.module.bot.edited[-1][1]["reply_markup"].rows
+                    for button in row
+                ]
+                for subprocess_index, (subprocess, unit) in enumerate(subprocesses):
+                    self.assertIn(subprocess, labels, f"{process} → {category}")
+                    self.module.handle_goal_callback(
+                        self.callback(message, f"g:subprocess:{subprocess_index}")
+                    )
+                    pending = self.module.get_user(123, "Іван Петренко")["pending_goal"]
+                    self.assertEqual(pending["subprocess"], subprocess)
+                    self.assertEqual(pending["unit"], unit)
+                    pending["stage"] = "subprocess"
+
     def test_multiple_personal_goals_are_saved_for_one_shift(self):
         message = self.message(self.module.SHIFT_GOAL_TEXT)
         self.active_shift_user(message)
