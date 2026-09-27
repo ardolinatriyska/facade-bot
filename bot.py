@@ -253,113 +253,6 @@ def weekly_summary_block_starts(column_values, formulas=False):
     return starts
 
 
-def weekly_summary_conditional_format_requests(sheet_id, block_starts):
-    worker_ranges = [
-        {
-            "sheetId": sheet_id,
-            "startRowIndex": start,
-            "endRowIndex": start + 1,
-            "startColumnIndex": 2,
-            "endColumnIndex": 11,
-        }
-        for start in block_starts
-    ]
-    balance_ranges = [
-        {
-            "sheetId": sheet_id,
-            "startRowIndex": start + 14,
-            "endRowIndex": start + 16,
-            "startColumnIndex": 2,
-            "endColumnIndex": 12,
-        }
-        for start in block_starts
-    ]
-    missing_rate_ranges = [
-        {
-            "sheetId": sheet_id,
-            "startRowIndex": start + 11,
-            "endRowIndex": start + 16,
-            "startColumnIndex": 11,
-            "endColumnIndex": 12,
-        }
-        for start in block_starts
-    ]
-
-    def add_rule(ranges, condition, cell_format):
-        return {
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": ranges,
-                    "booleanRule": {
-                        "condition": condition,
-                        "format": cell_format,
-                    },
-                },
-                "index": 0,
-            }
-        }
-
-    return [
-        add_rule(
-            worker_ranges,
-            {
-                "type": "CUSTOM_FORMULA",
-                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Бригадир"'}],
-            },
-            {"backgroundColor": {"red": 0.75686276, "green": 0.8980392, "blue": 0.7764706}},
-        ),
-        add_rule(
-            worker_ranges,
-            {
-                "type": "CUSTOM_FORMULA",
-                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Підсобник"'}],
-            },
-            {"backgroundColor": {"red": 0.7764706, "green": 0.8784314, "blue": 0.9764706}},
-        ),
-        add_rule(
-            worker_ranges,
-            {
-                "type": "CUSTOM_FORMULA",
-                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Не вказано"'}],
-            },
-            {"backgroundColor": {"red": 1, "green": 0.8784314, "blue": 0.69803923}},
-        ),
-        add_rule(
-            balance_ranges,
-            {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
-            {
-                "backgroundColor": {"red": 0.7882353, "green": 0.92941177, "blue": 0.8},
-                "textFormat": {
-                    "foregroundColor": {"red": 0.078431375, "green": 0.34901962, "blue": 0.11764706},
-                    "bold": True,
-                },
-            },
-        ),
-        add_rule(
-            balance_ranges,
-            {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
-            {
-                "backgroundColor": {"red": 0.9764706, "green": 0.8, "blue": 0.8},
-                "textFormat": {
-                    "foregroundColor": {"red": 0.6, "green": 0.047058824, "blue": 0.047058824},
-                    "bold": True,
-                },
-            },
-        ),
-        add_rule(
-            missing_rate_ranges,
-            {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": "ставк"}]},
-            {
-                "backgroundColor": {"red": 1, "green": 0.9098039, "blue": 0.61960787},
-                "textFormat": {
-                    "foregroundColor": {"red": 0.54901963, "green": 0.21960784},
-                    "bold": True,
-                },
-            },
-        ),
-    ]
-
-
 def ensure_weekly_summary_horizon(spreadsheet=None):
     spreadsheet = spreadsheet or get_sheet()
     worksheet = spreadsheet.worksheet(WEEKLY_SUMMARY_SHEET)
@@ -432,9 +325,6 @@ def ensure_weekly_summary_horizon(spreadsheet=None):
             }
         })
 
-    requests.extend(
-        weekly_summary_conditional_format_requests(sheet_id, new_block_starts)
-    )
     spreadsheet.batch_update({"requests": requests})
     return len(new_block_starts)
 

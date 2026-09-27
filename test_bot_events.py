@@ -2780,15 +2780,8 @@ class BotEventsTests(unittest.TestCase):
         self.assertEqual(copy_requests[0]["source"]["endRowIndex"], 291)
         self.assertEqual(copy_requests[0]["destination"]["startRowIndex"], 291)
         self.assertEqual(copy_requests[-1]["destination"]["startRowIndex"], 1011)
-        conditional_requests = [
-            request["addConditionalFormatRule"]
-            for request in requests
-            if "addConditionalFormatRule" in request
-        ]
-        self.assertEqual(len(conditional_requests), 6)
-        self.assertEqual(
-            len(conditional_requests[0]["rule"]["ranges"]),
-            41,
+        self.assertFalse(
+            any("addConditionalFormatRule" in request for request in requests)
         )
 
     def test_weekly_summary_does_not_duplicate_ready_templates(self):
