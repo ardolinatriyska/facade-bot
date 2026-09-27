@@ -210,6 +210,39 @@ class FakeSpreadsheet:
         return worksheet
 
 
+class FakeWeeklySummaryWorksheet:
+    def __init__(self, last_template_start, last_visible_start, row_count=1000):
+        self.title = "Підсумок захваток"
+        self.id = 70051214
+        self.row_count = row_count
+        self.last_template_start = last_template_start
+        self.last_visible_start = last_visible_start
+
+    def get(self, range_name, value_render_option=None):
+        last_row = (
+            self.last_template_start
+            if value_render_option == "FORMULA"
+            else self.last_visible_start
+        )
+        values = [[] for _ in range(max(0, last_row - 4 + 1))]
+        for row_number in range(4, last_row + 1, 18):
+            values[row_number - 4] = [
+                "=IF($X$1+INT((ROW()-4)/18)*7>TODAY();\"\";\"week\")"
+                if value_render_option == "FORMULA"
+                else "21.09.2026 — 27.09.2026"
+            ]
+        return values
+
+
+class FakeWeeklySummarySpreadsheet(FakeSpreadsheet):
+    def __init__(self, worksheet):
+        super().__init__([worksheet])
+        self.batch_updates = []
+
+    def batch_update(self, body):
+        self.batch_updates.append(body)
+
+
 class BotEventsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -217,6 +250,7 @@ class BotEventsTests(unittest.TestCase):
 
     def setUp(self):
         self.module.users.clear()
+        self.module.WEEKLY_SUMMARY_LAST_CHECK_DATE = None
         self.module.bot.sent.clear()
         self.module.bot.edited.clear()
         self.module.bot.answered_callbacks.clear()
@@ -2717,6 +2751,58 @@ class BotEventsTests(unittest.TestCase):
                 [self.module.CALC_HISTORY_TEXT, self.module.CALC_CLOSE_CAPTURE_TEXT],
             ],
         )
+
+    def test_weekly_summary_extends_full_template_horizon(self):
+        worksheet = FakeWeeklySummaryWorksheet(
+            last_template_start=274,
+            last_visible_start=76,
+        )
+        spreadsheet = FakeWeeklySummarySpreadsheet(worksheet)
+
+        created = self.module.ensure_weekly_summary_horizon(spreadsheet)
+
+        self.assertEqual(created, 41)
+        self.assertEqual(len(spreadsheet.batch_updates), 1)
+        requests = spreadsheet.batch_updates[0]["requests"]
+        self.assertEqual(
+            requests[0],
+            {
+                "appendDimension": {
+                    "sheetId": worksheet.id,
+                    "dimension": "ROWS",
+                    "length": 29,
+                }
+            },
+        )
+        copy_requests = [request["copyPaste"] for request in requests if "copyPaste" in request]
+        self.assertEqual(len(copy_requests), 41)
+        self.assertEqual(copy_requests[0]["source"]["startRowIndex"], 273)
+        self.assertEqual(copy_requests[0]["source"]["endRowIndex"], 291)
+        self.assertEqual(copy_requests[0]["destination"]["startRowIndex"], 291)
+        self.assertEqual(copy_requests[-1]["destination"]["startRowIndex"], 1011)
+        conditional_requests = [
+            request["addConditionalFormatRule"]
+            for request in requests
+            if "addConditionalFormatRule" in request
+        ]
+        self.assertEqual(len(conditional_requests), 6)
+        self.assertEqual(
+            len(conditional_requests[0]["rule"]["ranges"]),
+            41,
+        )
+
+    def test_weekly_summary_does_not_duplicate_ready_templates(self):
+        worksheet = FakeWeeklySummaryWorksheet(
+            last_template_start=1012,
+            last_visible_start=76,
+            row_count=1029,
+        )
+        spreadsheet = FakeWeeklySummarySpreadsheet(worksheet)
+
+        created = self.module.ensure_weekly_summary_horizon(spreadsheet)
+
+        self.assertEqual(created, 0)
+        self.assertEqual(spreadsheet.batch_updates, [])
 
     def test_sasha_button_is_visible_only_to_configured_people(self):
         base_rows = self.module.calculations_keyboard(123).rows

@@ -71,6 +71,15 @@ BOT_INFO = bot.get_me()
 BOT_USERNAME = BOT_INFO.username
 BOT_ID = BOT_INFO.id
 MATERIAL_WRITE_LOCK = threading.RLock()
+WEEKLY_SUMMARY_LOCK = threading.RLock()
+WEEKLY_SUMMARY_LAST_CHECK_DATE = None
+
+WEEKLY_SUMMARY_SHEET = "Підсумок захваток"
+WEEKLY_SUMMARY_FIRST_ROW = 4
+WEEKLY_SUMMARY_BLOCK_ROWS = 18
+WEEKLY_SUMMARY_LAST_COLUMN_INDEX = 12
+WEEKLY_SUMMARY_MIN_FUTURE_WEEKS = 26
+WEEKLY_SUMMARY_TARGET_FUTURE_WEEKS = 52
 
 
 def serialized_material_write(function):
@@ -229,6 +238,218 @@ def get_sheet():
     client = gspread.authorize(credentials)
     spreadsheet = client.open_by_key(SHEET_ID)
     return spreadsheet
+
+
+def weekly_summary_block_starts(column_values, formulas=False):
+    starts = []
+    for offset, row in enumerate(column_values):
+        row_number = WEEKLY_SUMMARY_FIRST_ROW + offset
+        if (row_number - WEEKLY_SUMMARY_FIRST_ROW) % WEEKLY_SUMMARY_BLOCK_ROWS:
+            continue
+        value = row[0] if row else ""
+        text = str(value or "").strip()
+        if text and (not formulas or text.startswith("=")):
+            starts.append(row_number)
+    return starts
+
+
+def weekly_summary_conditional_format_requests(sheet_id, block_starts):
+    worker_ranges = [
+        {
+            "sheetId": sheet_id,
+            "startRowIndex": start,
+            "endRowIndex": start + 1,
+            "startColumnIndex": 2,
+            "endColumnIndex": 11,
+        }
+        for start in block_starts
+    ]
+    balance_ranges = [
+        {
+            "sheetId": sheet_id,
+            "startRowIndex": start + 14,
+            "endRowIndex": start + 16,
+            "startColumnIndex": 2,
+            "endColumnIndex": 12,
+        }
+        for start in block_starts
+    ]
+    missing_rate_ranges = [
+        {
+            "sheetId": sheet_id,
+            "startRowIndex": start + 11,
+            "endRowIndex": start + 16,
+            "startColumnIndex": 11,
+            "endColumnIndex": 12,
+        }
+        for start in block_starts
+    ]
+
+    def add_rule(ranges, condition, cell_format):
+        return {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": ranges,
+                    "booleanRule": {
+                        "condition": condition,
+                        "format": cell_format,
+                    },
+                },
+                "index": 0,
+            }
+        }
+
+    return [
+        add_rule(
+            worker_ranges,
+            {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Бригадир"'}],
+            },
+            {"backgroundColor": {"red": 0.75686276, "green": 0.8980392, "blue": 0.7764706}},
+        ),
+        add_rule(
+            worker_ranges,
+            {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Підсобник"'}],
+            },
+            {"backgroundColor": {"red": 0.7764706, "green": 0.8784314, "blue": 0.9764706}},
+        ),
+        add_rule(
+            worker_ranges,
+            {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": '=INDEX(C:C;ROW()+1)="Не вказано"'}],
+            },
+            {"backgroundColor": {"red": 1, "green": 0.8784314, "blue": 0.69803923}},
+        ),
+        add_rule(
+            balance_ranges,
+            {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+            {
+                "backgroundColor": {"red": 0.7882353, "green": 0.92941177, "blue": 0.8},
+                "textFormat": {
+                    "foregroundColor": {"red": 0.078431375, "green": 0.34901962, "blue": 0.11764706},
+                    "bold": True,
+                },
+            },
+        ),
+        add_rule(
+            balance_ranges,
+            {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+            {
+                "backgroundColor": {"red": 0.9764706, "green": 0.8, "blue": 0.8},
+                "textFormat": {
+                    "foregroundColor": {"red": 0.6, "green": 0.047058824, "blue": 0.047058824},
+                    "bold": True,
+                },
+            },
+        ),
+        add_rule(
+            missing_rate_ranges,
+            {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": "ставк"}]},
+            {
+                "backgroundColor": {"red": 1, "green": 0.9098039, "blue": 0.61960787},
+                "textFormat": {
+                    "foregroundColor": {"red": 0.54901963, "green": 0.21960784},
+                    "bold": True,
+                },
+            },
+        ),
+    ]
+
+
+def ensure_weekly_summary_horizon(spreadsheet=None):
+    spreadsheet = spreadsheet or get_sheet()
+    worksheet = spreadsheet.worksheet(WEEKLY_SUMMARY_SHEET)
+    range_name = f"C{WEEKLY_SUMMARY_FIRST_ROW}:C{worksheet.row_count}"
+    formula_values = worksheet.get(range_name, value_render_option="FORMULA")
+    displayed_values = worksheet.get(range_name, value_render_option="FORMATTED_VALUE")
+    template_starts = weekly_summary_block_starts(formula_values, formulas=True)
+    visible_starts = weekly_summary_block_starts(displayed_values)
+
+    if not template_starts:
+        raise ValueError("У вкладці «Підсумок захваток» не знайдено шаблон тижня.")
+
+    last_template_start = max(template_starts)
+    last_visible_start = max(visible_starts) if visible_starts else min(template_starts)
+    future_weeks = max(
+        0,
+        (last_template_start - last_visible_start) // WEEKLY_SUMMARY_BLOCK_ROWS,
+    )
+    if future_weeks >= WEEKLY_SUMMARY_MIN_FUTURE_WEEKS:
+        return 0
+
+    target_last_start = (
+        last_visible_start
+        + WEEKLY_SUMMARY_TARGET_FUTURE_WEEKS * WEEKLY_SUMMARY_BLOCK_ROWS
+    )
+    block_count = (
+        target_last_start - last_template_start + WEEKLY_SUMMARY_BLOCK_ROWS - 1
+    ) // WEEKLY_SUMMARY_BLOCK_ROWS
+    new_block_starts = [
+        last_template_start + index * WEEKLY_SUMMARY_BLOCK_ROWS
+        for index in range(1, block_count + 1)
+    ]
+    if not new_block_starts:
+        return 0
+
+    sheet_id = worksheet.id
+    required_rows = new_block_starts[-1] + WEEKLY_SUMMARY_BLOCK_ROWS - 1
+    requests = []
+    if required_rows > worksheet.row_count:
+        requests.append({
+            "appendDimension": {
+                "sheetId": sheet_id,
+                "dimension": "ROWS",
+                "length": required_rows - worksheet.row_count,
+            }
+        })
+
+    source_start_index = last_template_start - 1
+    source_end_index = source_start_index + WEEKLY_SUMMARY_BLOCK_ROWS
+    for block_start in new_block_starts:
+        destination_start_index = block_start - 1
+        requests.append({
+            "copyPaste": {
+                "source": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": source_start_index,
+                    "endRowIndex": source_end_index,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": WEEKLY_SUMMARY_LAST_COLUMN_INDEX,
+                },
+                "destination": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": destination_start_index,
+                    "endRowIndex": destination_start_index + WEEKLY_SUMMARY_BLOCK_ROWS,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": WEEKLY_SUMMARY_LAST_COLUMN_INDEX,
+                },
+                "pasteType": "PASTE_NORMAL",
+                "pasteOrientation": "NORMAL",
+            }
+        })
+
+    requests.extend(
+        weekly_summary_conditional_format_requests(sheet_id, new_block_starts)
+    )
+    spreadsheet.batch_update({"requests": requests})
+    return len(new_block_starts)
+
+
+def ensure_weekly_summary_once_per_day(force=False, spreadsheet=None, current=None):
+    global WEEKLY_SUMMARY_LAST_CHECK_DATE
+    check_date = (current or now_dt()).date()
+    with WEEKLY_SUMMARY_LOCK:
+        if not force and WEEKLY_SUMMARY_LAST_CHECK_DATE == check_date:
+            return 0
+        created = ensure_weekly_summary_horizon(spreadsheet)
+        WEEKLY_SUMMARY_LAST_CHECK_DATE = check_date
+        return created
+
+
 def get_or_create_worksheet(spreadsheet, title, headers):
     try:
         worksheet = spreadsheet.worksheet(title)
@@ -1218,6 +1439,16 @@ def weather_scheduler():
             except Exception as error:
                 print(f"Weather forecast failed: {error}")
         time.sleep(30)
+
+
+def weekly_summary_scheduler():
+    """Keep enough future weekly report templates ready for automatic display."""
+    while True:
+        try:
+            ensure_weekly_summary_once_per_day()
+        except Exception as error:
+            print(f"Weekly summary preparation failed: {error}")
+        time.sleep(300)
 
 
 def show_remaining_weather_forecast(message):
@@ -5369,6 +5600,7 @@ def main():
     print("Bot is running...")
     threading.Thread(target=weather_scheduler, daemon=True).start()
     threading.Thread(target=automatic_shift_closure_scheduler, daemon=True).start()
+    threading.Thread(target=weekly_summary_scheduler, daemon=True).start()
     bot.infinity_polling(skip_pending=True)
 
 
