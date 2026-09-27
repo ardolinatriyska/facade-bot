@@ -2776,8 +2776,8 @@ class BotEventsTests(unittest.TestCase):
         )
         copy_requests = [request["copyPaste"] for request in requests if "copyPaste" in request]
         self.assertEqual(len(copy_requests), 41)
-        self.assertEqual(copy_requests[0]["source"]["startRowIndex"], 273)
-        self.assertEqual(copy_requests[0]["source"]["endRowIndex"], 291)
+        self.assertEqual(copy_requests[0]["source"]["startRowIndex"], 3)
+        self.assertEqual(copy_requests[0]["source"]["endRowIndex"], 21)
         self.assertEqual(copy_requests[0]["destination"]["startRowIndex"], 291)
         self.assertEqual(copy_requests[-1]["destination"]["startRowIndex"], 1011)
         self.assertFalse(

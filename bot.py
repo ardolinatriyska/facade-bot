@@ -300,7 +300,7 @@ def ensure_weekly_summary_horizon(spreadsheet=None):
             }
         })
 
-    source_start_index = last_template_start - 1
+    source_start_index = min(template_starts) - 1
     source_end_index = source_start_index + WEEKLY_SUMMARY_BLOCK_ROWS
     for block_start in new_block_starts:
         destination_start_index = block_start - 1
